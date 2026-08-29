@@ -1,0 +1,51 @@
+version: "3.9"
+
+services:
+  api-football-mcp:
+    build: .
+    restart: unless-stopped
+    environment:
+      - API_FOOTBALL_KEY=${API_FOOTBALL_KEY}
+      - NODE_ENV=production
+      - LOG_LEVEL=info
+      - CACHE_MAX_SIZE=1000
+      - CACHE_TTL=300000
+    networks:
+      - mcp-network
+
+  # Wrapper HTTP pour exposer en SSE/Streamable
+  mcp-http-wrapper:
+    image: ghcr.io/zueai/mcp-gateway:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - API_FOOTBALL_KEY=${API_FOOTBALL_KEY}
+    command: >
+      sh -c "
+      echo '{
+        \"mcpServers\": {
+          \"api-football\": {
+            \"command\": \"node\",
+            \"args\": [\"/app/dist/server.js\"],
+            \"env\": {
+              \"API_FOOTBALL_KEY\": \"${API_FOOTBALL_KEY}\"
+            }
+          }
+        }
+      }' > /config.json &&
+      mcp-gateway --config /config.json
+      "
+    depends_on:
+      - api-football-mcp
+    networks:
+      - mcp-network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  mcp-network:
+    driver: bridge
