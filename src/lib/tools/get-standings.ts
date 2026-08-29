@@ -5,7 +5,7 @@ import { CacheKeys } from '../cache/keys'
 import { getCachePolicy } from '../cache/policies'
 import { parseStanding } from '../api-client/parser'
 import { logger } from '../logger/logger'
-import { SEASON_CONFIG } from '../../models/season'
+import { SEASON_CONFIG, getCurrentPremierLeagueSeason } from '../../models/season'
 import { GetStandingsResult } from '../../types/tool-results'
 import { getToolArguments } from './params'
 
@@ -40,7 +40,7 @@ export class GetStandingsTool implements Tool {
   async call (request: CallToolRequest): Promise<CallToolResult> {
     try {
       const params = getToolArguments<GetStandingsParams>(request)
-      const season = params.season || new Date().getFullYear()
+      const season = params.season ?? getCurrentPremierLeagueSeason()
 
       // Validate season range
       if (season < SEASON_CONFIG.MINIMUM_SEASON || season > SEASON_CONFIG.MAXIMUM_SEASON) {
