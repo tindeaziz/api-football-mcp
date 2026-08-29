@@ -3,21 +3,34 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+
     restart: unless-stopped
-    command: >
-    sh -c "
-    npm install -g supergateway &&
-    supergateway --stdio 'node dist/server.js' --outputTransport streamableHttp --port 3000 --streamableHttpPath /mcp --cors --healthEndpoints /health
-    "
+
     environment:
-      - API_FOOTBALL_KEY=${API_FOOTBALL_KEY}
-      - NODE_ENV=production
-      - LOG_LEVEL=info
+      API_FOOTBALL_KEY: ${API_FOOTBALL_KEY}
+      NODE_ENV: production
+      LOG_LEVEL: info
+
+    command: >
+      sh -c "
+      npm install -g supergateway &&
+      supergateway
+      --stdio 'node dist/server.js'
+      --outputTransport streamableHttp
+      --port 3000
+      --streamableHttpPath /mcp
+      --cors
+      --healthEndpoints /health
+      "
+
     ports:
       - "3000:3000"
-healthcheck:
-  test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"]
-  interval: 30s
-  timeout: 10s
-  retries: 5
-  start_period: 30s
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q --spider http://127.0.0.1:3000/health || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
