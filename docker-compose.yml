@@ -5,10 +5,10 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     command: >
-      sh -c "
-      npm install -g supergateway &&
-      supergateway --stdio 'node dist/server.js' --outputTransport streamableHttp --port 3000 --streamableHttpPath /mcp --cors --healthEndpoints /health
-      "
+    sh -c "
+    npm install -g supergateway &&
+    supergateway --stdio 'node dist/server.js' --outputTransport streamableHttp --port 3000 --streamableHttpPath /mcp --cors --healthEndpoints /health
+    "
     environment:
       - API_FOOTBALL_KEY=${API_FOOTBALL_KEY}
       - NODE_ENV=production
