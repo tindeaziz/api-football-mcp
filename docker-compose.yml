@@ -20,16 +20,23 @@ services:
       --port 3000
       --streamableHttpPath /mcp
       --cors
-      --healthEndpoints /health
       "
 
-    ports:
-      - "3000:3000"
+    expose:
+      - "3000"
+
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.football-mcp.rule=Host(\`football-mcp.danitechs.online\`)"
+      - "traefik.http.routers.football-mcp.entrypoints=websecure"
+      - "traefik.http.routers.football-mcp.tls=true"
+      - "traefik.http.routers.football-mcp.tls.certresolver=letsencrypt"
+      - "traefik.http.services.football-mcp.loadbalancer.server.port=3000"
 
     healthcheck:
       test:
         - CMD-SHELL
-        - wget -q --spider http://127.0.0.1:3000/health || exit 1
+        - "wget -q --spider http://127.0.0.1:3000/mcp || exit 1"
       interval: 30s
       timeout: 10s
       retries: 5
