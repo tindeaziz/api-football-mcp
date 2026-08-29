@@ -17,29 +17,11 @@
  *
  * All raw API responses are cached on disk under .cache/report/ so a re-run
  * on the same day costs almost no API calls. --refresh ignores the cache.
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
  *
  * If ANTHROPIC_API_KEY is set, each match is also sent to Claude with the
  * numbers above and a fixed set of reading rules; the returned French
  * analysis (verdict, main pick, alternative, what to avoid, reasoning) and a
  * day synthesis are embedded in the page. --no-llm skips this step.
-<<<<<<< ours
-<<<<<<< ours
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
  */
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
@@ -53,24 +35,8 @@ import { fileURLToPath } from 'node:url'
 const BASE = process.env.API_BASE_URL ?? 'https://v3.football.api-sports.io'
 const KEY = process.env.API_FOOTBALL_KEY
 const PACE_MS = Number(process.env.API_PACE_MS ?? 250) // Pro plan: 300 req/min
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY
 const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL ?? 'claude-sonnet-5'
-=======
->>>>>>> theirs
-=======
-const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY
-const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL ?? 'claude-sonnet-5'
->>>>>>> theirs
-=======
->>>>>>> theirs
-=======
-const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY
-const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL ?? 'claude-sonnet-5'
->>>>>>> theirs
 
 export const LEAGUES = {
   39: { name: 'Premier League', country: 'England', avgHome: 1.55, avgAway: 1.35 },
@@ -88,23 +54,7 @@ const EDGE_FLAG = 0.05 // 5 points of probability = worth a look
 // ------------------------------------------------------------------- args
 
 function parseArgs (argv) {
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
   const args = { seasons: 4, leagues: Object.keys(LEAGUES).map(Number), bookmaker: 8, out: 'reports', refresh: false, llm: true }
-=======
-  const args = { seasons: 4, leagues: Object.keys(LEAGUES).map(Number), bookmaker: 8, out: 'reports', refresh: false }
->>>>>>> theirs
-=======
-  const args = { seasons: 4, leagues: Object.keys(LEAGUES).map(Number), bookmaker: 8, out: 'reports', refresh: false, llm: true }
->>>>>>> theirs
-=======
-  const args = { seasons: 4, leagues: Object.keys(LEAGUES).map(Number), bookmaker: 8, out: 'reports', refresh: false }
->>>>>>> theirs
-=======
-  const args = { seasons: 4, leagues: Object.keys(LEAGUES).map(Number), bookmaker: 8, out: 'reports', refresh: false, llm: true }
->>>>>>> theirs
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     const next = () => argv[++i]
@@ -114,21 +64,7 @@ function parseArgs (argv) {
     else if (a === '--bookmaker') args.bookmaker = Number(next())
     else if (a === '--out') args.out = next()
     else if (a === '--refresh') args.refresh = true
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
     else if (a === '--no-llm') args.llm = false
-=======
->>>>>>> theirs
-=======
-    else if (a === '--no-llm') args.llm = false
->>>>>>> theirs
-=======
->>>>>>> theirs
-=======
-    else if (a === '--no-llm') args.llm = false
->>>>>>> theirs
   }
   if (!args.date) {
     const d = new Date(); d.setUTCDate(d.getUTCDate() + 1)
@@ -196,22 +132,13 @@ async function collectFixture (fx, args) {
   const season = currentSeason(new Date(fx.fixture.date))
   const seasons = Array.from({ length: args.seasons + 1 }, (_, i) => season - i) // current + N complete
   const stats = {}
-<<<<<<< ours
-<<<<<<< ours
   const context = {}
-=======
->>>>>>> theirs
-=======
-  const context = {}
->>>>>>> theirs
   for (const team of [home, away]) {
     stats[team] = {}
     for (const s of seasons) {
       const ttl = s < season ? 30 * DAY : 6 * HOUR
       stats[team][s] = await api('/teams/statistics', { league, season: s, team }, { ttlMs: ttl, ...opts }).catch(() => null)
     }
-<<<<<<< ours
-<<<<<<< ours
     context[team] = await collectTeamContext(team, season, opts)
   }
 
@@ -233,33 +160,6 @@ async function collectTeamContext (team, season, opts) {
   const transfers = await api('/transfers', { team }, { ttlMs: DAY, ...opts }).then(r => r ?? []).catch(() => [])
   const coach = await api('/coachs', { team }, { ttlMs: DAY, ...opts }).then(r => r ?? []).catch(() => [])
   return { recent, transfers, coach, season }
-=======
-  }
-  return { fixture: fx, prediction, odds: oddsRaw, injuries, h2h, lineups, stats, seasons }
->>>>>>> theirs
-=======
-    context[team] = await collectTeamContext(team, season, opts)
-  }
-
-  // League-level context, cached across fixtures of the same league
-  const standings = await api('/standings', { league, season }, { ttlMs: 6 * HOUR, ...opts })
-    .then(r => r[0]?.league?.standings?.flat() ?? []).catch(() => [])
-  const topScorers = await api('/players/topscorers', { league, season: season - 1 }, { ttlMs: 30 * DAY, ...opts }).catch(() => [])
-
-  return { fixture: fx, prediction, odds: oddsRaw, injuries, h2h, lineups, stats, seasons, context, standings, topScorers }
-}
-
-/** Recent matches with xG, summer transfers and current coach for one team. */
-async function collectTeamContext (team, season, opts) {
-  const recentList = await api('/fixtures', { team, last: 6 }, { ttlMs: 6 * HOUR, ...opts }).catch(() => [])
-  const ids = recentList.map(f => f.fixture.id)
-  const recent = ids.length
-    ? await api('/fixtures', { ids: ids.join('-') }, { ttlMs: 6 * HOUR, ...opts }).catch(() => recentList)
-    : []
-  const transfers = await api('/transfers', { team }, { ttlMs: DAY, ...opts }).then(r => r ?? []).catch(() => [])
-  const coach = await api('/coachs', { team }, { ttlMs: DAY, ...opts }).then(r => r ?? []).catch(() => [])
-  return { recent, transfers, coach, season }
->>>>>>> theirs
 }
 
 // -------------------------------------------------------------------- model
@@ -293,10 +193,6 @@ function weightedRates (perSeason, seasons, side) {
 
 function poisson (l, k) { let f = 1; for (let i = 2; i <= k; i++) f *= i; return Math.exp(-l) * l ** k / f }
 
-<<<<<<< ours
-<<<<<<< ours
-=======
->>>>>>> theirs
 const RECENT_XG_WEIGHT = 0.3 // share of the strength taken from last-6 xG (venue-agnostic)
 
 function blendRecent (base, recent, side, lg) {
@@ -316,7 +212,6 @@ function blendRecent (base, recent, side, lg) {
   }
 }
 
-<<<<<<< ours
 export function fitModel (data) {
   const { fixture, stats, seasons, context } = data
   const lg = LEAGUES[fixture.league.id] ?? { avgHome: 1.5, avgAway: 1.3 }
@@ -328,24 +223,6 @@ export function fitModel (data) {
   const ra = recentForm(context?.[away]?.recent ?? [], away)
   H = blendRecent(H, rh, 'home', lg)
   A = blendRecent(A, ra, 'away', lg)
-=======
-=======
->>>>>>> theirs
-export function fitModel (data) {
-  const { fixture, stats, seasons, context } = data
-  const lg = LEAGUES[fixture.league.id] ?? { avgHome: 1.5, avgAway: 1.3 }
-  const home = fixture.teams.home.id; const away = fixture.teams.away.id
-  let H = weightedRates(stats[home], seasons, 'home')
-  let A = weightedRates(stats[away], seasons, 'away')
-  if (!H || !A) return null
-<<<<<<< ours
->>>>>>> theirs
-=======
-  const rh = recentForm(context?.[home]?.recent ?? [], home)
-  const ra = recentForm(context?.[away]?.recent ?? [], away)
-  H = blendRecent(H, rh, 'home', lg)
-  A = blendRecent(A, ra, 'away', lg)
->>>>>>> theirs
 
   const lambdaHome = (H.att / lg.avgHome) * (A.def / lg.avgAway) * lg.avgHome
   const lambdaAway = (A.att / lg.avgAway) * (H.def / lg.avgHome) * lg.avgAway
@@ -450,10 +327,6 @@ function h2hSummary (h2h, homeId) {
   return rec
 }
 
-<<<<<<< ours
-<<<<<<< ours
-=======
->>>>>>> theirs
 const statOf = (block, type) => {
   const v = block?.statistics?.find(x => x.type === type)?.value
   if (v === null || v === undefined || v === '') return null
@@ -532,11 +405,6 @@ function keyPlayerAbsences (topScorers, injuries, teamId) {
   return { topScorers: mine.slice(0, 3), absentKeyPlayers: mine.filter(p => absentIds.has(p.id)) }
 }
 
-<<<<<<< ours
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
 function injurySummary (injuries) {
   return injuries.map(i => ({ team: i.team.name, player: i.player.name, type: i.player.type, reason: i.player.reason }))
 }
@@ -545,10 +413,6 @@ function lineupSummary (lineups) {
   return lineups.map(l => ({ team: l.team.name, formation: l.formation, coach: l.coach?.name, xi: (l.startXI ?? []).map(p => p.player.name) }))
 }
 
-<<<<<<< ours
-<<<<<<< ours
-=======
->>>>>>> theirs
 function teamContext (data, teamId) {
   const c = data.context?.[teamId]
   if (!c) return null
@@ -562,11 +426,6 @@ function teamContext (data, teamId) {
   }
 }
 
-<<<<<<< ours
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
 export function analyse (data) {
   const model = fitModel(data)
   const market = marketView(data.odds)
@@ -588,28 +447,15 @@ export function analyse (data) {
     h2h: h2hSummary(data.h2h, fx.teams.home.id),
     injuries: injurySummary(data.injuries),
     lineups: lineupSummary(data.lineups),
-<<<<<<< ours
-<<<<<<< ours
-=======
->>>>>>> theirs
     context: {
       home: teamContext(data, fx.teams.home.id),
       away: teamContext(data, fx.teams.away.id)
     },
-<<<<<<< ours
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
     notes: [
       data.prediction?.error ? `Prediction unavailable: ${data.prediction.error}` : null,
       data.odds?.error ? `Odds unavailable: ${data.odds.error}` : null,
       !model ? 'Model not fitted: insufficient season statistics for one of the teams (promoted club?)' : null,
       model && model.strengths.home.weight < 1.2 ? 'Home side strengths rest on little history — treat with caution' : null,
-<<<<<<< ours
-<<<<<<< ours
-=======
->>>>>>> theirs
       model && model.strengths.away.weight < 1.2 ? 'Away side strengths rest on little history — treat with caution' : null,
       ...['home', 'away'].flatMap(side => {
         const t = side === 'home' ? fx.teams.home : fx.teams.away
@@ -623,24 +469,10 @@ export function analyse (data) {
         if (c.recent.xgMatches && c.recent.xgFor !== null && c.recent.goalsFor !== null && c.recent.xgFor - c.recent.goalsFor > 0.6) out.push(`${t.name}: creating far more than it scores (xG ${c.recent.xgFor} vs ${c.recent.goalsFor} goals) — underperforming`)
         return out
       })
-<<<<<<< ours
-=======
-      model && model.strengths.away.weight < 1.2 ? 'Away side strengths rest on little history — treat with caution' : null
->>>>>>> theirs
-=======
->>>>>>> theirs
     ].filter(Boolean)
   }
 }
 
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
 
 // ---------------------------------------------------------------------- llm
 
@@ -668,20 +500,11 @@ Règles de lecture, à appliquer systématiquement :
    ne vaut un pari, dis-le : "pas de pari" est une réponse valable.
 7. Confiance sur 1 à 5. Un 4 ou 5 exige que le modèle, le marché et les absences convergent.
 8. Ne jamais présenter une probabilité comme une certitude ; un pari recommandé perd souvent.
-<<<<<<< ours
-<<<<<<< ours
-=======
->>>>>>> theirs
 9. Le bloc "context" est prioritaire sur l'historique long : classement et forme actuels, xG des 6
    derniers matchs (une équipe qui marque bien au-dessus de son xG va régresser ; l'inverse aussi),
    effectif remanié (6 arrivées définitives ou plus = l'historique ne décrit plus l'équipe), coach
    nommé depuis moins de 90 jours, et buteurs majeurs de la saison passée absents aujourd'hui.
    Quand le contexte contredit le modèle, dis-le et suis le contexte.
-<<<<<<< ours
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
 
 Réponds uniquement en JSON, sans texte autour, avec exactement ces clés :
 {"verdict": "une phrase", "confidence": 1-5, "mainPick": "pari + cote si connue", "altPick": "pari ou null",
@@ -726,10 +549,6 @@ function compactForLlm (m) {
     seasons: { home: m.seasons.home, away: m.seasons.away },
     h2h: { record: `${m.h2h.homeTeamWins}-${m.h2h.draws}-${m.h2h.awayTeamWins}`, avgGoals: m.h2h.avgGoals, last: m.h2h.matches.slice(0, 6) },
     injuries: m.injuries, lineups: m.lineups.map(l => ({ team: l.team, formation: l.formation, xi: l.xi })),
-<<<<<<< ours
-<<<<<<< ours
-=======
->>>>>>> theirs
     context: m.context && Object.fromEntries(['home', 'away'].map(side => {
       const c = m.context[side]
       if (!c) return [side, null]
@@ -741,11 +560,6 @@ function compactForLlm (m) {
         keyPlayers: c.keyPlayers
       }]
     })),
-<<<<<<< ours
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
     apiPrediction: m.apiPrediction, notes: m.notes
   }
 }
@@ -771,16 +585,6 @@ export async function narrate (matches) {
   }
 }
 
-<<<<<<< ours
-<<<<<<< ours
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
 // --------------------------------------------------------------------- html
 
 const pct = (p) => (p === undefined || p === null ? '—' : `${(p * 100).toFixed(0)}%`)
@@ -825,23 +629,7 @@ nav .teams{font-weight:600}
 nav .sub{font-family:var(--mono);font-size:11px;color:var(--ink-2);display:flex;justify-content:space-between;margin-top:2px}
 .edge-pill{font-family:var(--mono);font-size:11px;padding:1px 6px;border-radius:3px;background:var(--edge-soft);color:#9A3412}
 .edge-pill.none{background:#E2E8F0;color:var(--ink-2)}
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
 #panels{min-width:0}section.match{display:none;padding:26px 32px 60px;max-width:1100px;min-width:0}.card{min-width:0;overflow-x:auto}
-=======
-section.match{display:none;padding:26px 32px 60px;max-width:1100px}
->>>>>>> theirs
-=======
-#panels{min-width:0}section.match{display:none;padding:26px 32px 60px;max-width:1100px;min-width:0}.card{min-width:0;overflow-x:auto}
->>>>>>> theirs
-=======
-section.match{display:none;padding:26px 32px 60px;max-width:1100px}
->>>>>>> theirs
-=======
-#panels{min-width:0}section.match{display:none;padding:26px 32px 60px;max-width:1100px;min-width:0}.card{min-width:0;overflow-x:auto}
->>>>>>> theirs
 section.match[aria-hidden="false"]{display:block}
 .title{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
 .title img{width:44px;height:44px;object-fit:contain}
@@ -873,14 +661,6 @@ tr.flag td{background:var(--edge-soft)}
 .scores div{font-family:var(--display);font-size:22px;font-weight:700;padding:6px 12px;border:1px solid var(--rule);border-radius:4px}
 .scores div small{display:block;font-family:var(--mono);font-size:11px;font-weight:400;color:var(--ink-2)}
 .empty{color:var(--ink-2);font-style:italic}
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
 .read{border-left:4px solid var(--edge);background:#FFF9F5}
 .read .verdict{font-family:var(--display);font-size:22px;font-weight:700;line-height:1.15;margin:0 0 8px}
 .read .conf{font-family:var(--mono);font-size:11px;color:var(--ink-2);letter-spacing:1px}
@@ -891,16 +671,6 @@ tr.flag td{background:var(--edge-soft)}
 .picks .main{border-color:var(--edge)}
 .synth ol{padding-left:20px}.synth li{margin-bottom:8px}
 @media (max-width:900px){.picks{grid-template-columns:1fr}}
-<<<<<<< ours
-<<<<<<< ours
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
 @media (max-width:900px){main{grid-template-columns:1fr}nav{border-right:0;border-bottom:1px solid var(--rule);max-height:40vh}.grid{grid-template-columns:1fr}section.match{padding:18px}header h1{font-size:32px}}
 @media (prefers-reduced-motion:no-preference){section.match[aria-hidden="false"]{animation:in .18s ease-out}@keyframes in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}}
 </style>
@@ -926,23 +696,7 @@ const ranked = [...R.matches].sort((a,b)=>b.bestEdge-a.bestEdge);
 const groups = {};
 for (const m of ranked) (groups[m.league.name] ??= []).push(m);
 
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
 nav.innerHTML = (R.synthesis ? '<h2>Journée</h2><button role="tab" data-id="synth"><div class="teams">Synthèse du jour</div><div class="sub"><span>lecture globale</span></div></button>' : '') + '<h2>Classés par edge</h2>' + ranked.map(m => navItem(m)).join('') +
-=======
-nav.innerHTML = '<h2>Classés par edge</h2>' + ranked.map(m => navItem(m)).join('') +
->>>>>>> theirs
-=======
-nav.innerHTML = (R.synthesis ? '<h2>Journée</h2><button role="tab" data-id="synth"><div class="teams">Synthèse du jour</div><div class="sub"><span>lecture globale</span></div></button>' : '') + '<h2>Classés par edge</h2>' + ranked.map(m => navItem(m)).join('') +
->>>>>>> theirs
-=======
-nav.innerHTML = '<h2>Classés par edge</h2>' + ranked.map(m => navItem(m)).join('') +
->>>>>>> theirs
-=======
-nav.innerHTML = (R.synthesis ? '<h2>Journée</h2><button role="tab" data-id="synth"><div class="teams">Synthèse du jour</div><div class="sub"><span>lecture globale</span></div></button>' : '') + '<h2>Classés par edge</h2>' + ranked.map(m => navItem(m)).join('') +
->>>>>>> theirs
   Object.entries(groups).map(([lg, ms]) => '<h2>'+esc(lg)+'</h2>' + ms.map(navItem).join('')).join('');
 
 function navItem(m){
@@ -951,14 +705,6 @@ function navItem(m){
   return '<button role="tab" data-id="'+m.id+'"><div class="teams">'+esc(m.home.name)+' – '+esc(m.away.name)+'</div><div class="sub"><span>'+esc(m.league.name)+' · '+m.kickoff.slice(11,16)+'</span>'+pill+'</div></button>';
 }
 
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
 panels.innerHTML = (R.synthesis ? synthPanel(R.synthesis) : '') + R.matches.map(panel).join('');
 
 function synthPanel(s){
@@ -977,18 +723,6 @@ function readCard(a){
     + '<div class="picks"><div class="main"><small>Pari principal</small>'+esc(a.mainPick)+'</div><div><small>Alternative</small>'+(a.altPick?esc(a.altPick):'<span class="empty">aucune</span>')+'</div><div><small>À éviter</small>'+(a.avoid?esc(a.avoid):'<span class="empty">—</span>')+'</div></div>'
     + '<p style="margin:0">'+esc(a.reasoning)+'</p></div>';
 }
-<<<<<<< ours
-<<<<<<< ours
-=======
-panels.innerHTML = R.matches.map(panel).join('');
->>>>>>> theirs
-=======
->>>>>>> theirs
-=======
-panels.innerHTML = R.matches.map(panel).join('');
->>>>>>> theirs
-=======
->>>>>>> theirs
 
 function form(s){ return '<span class="form">'+[...(s||'')].map(c=>c==='W'?'<b>W</b>':c==='L'?'<i>L</i>':'<u>D</u>').join('')+'</span>'; }
 
@@ -1019,45 +753,20 @@ function panel(m){
     + '<p class="kick">'+esc(m.league.name)+' · '+esc(m.league.round)+' · '+m.kickoff.replace('T',' ').slice(0,16)+' UTC'+(m.venue?' · '+esc(m.venue):'')+'</p>'
     + m.notes.map(n=>'<div class="note">'+esc(n)+'</div>').join('')
     + '<div class="grid">'
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
     + readCard(m.analysis)
-=======
->>>>>>> theirs
-=======
-    + readCard(m.analysis)
->>>>>>> theirs
-=======
->>>>>>> theirs
-=======
-    + readCard(m.analysis)
->>>>>>> theirs
     + '<div class="card wide"><h3>Modèle contre marché — 1N2</h3>'+bar+'</div>'
     + '<div class="card"><h3>Écarts par pari</h3>'+edgeRows+'</div>'
     + '<div class="card"><h3>Scores probables</h3>'+scores+'</div>'
     + '<div class="card"><h3>'+esc(m.home.name)+' — historique</h3>'+seasonTbl('home')+'</div>'
     + '<div class="card"><h3>'+esc(m.away.name)+' — historique</h3>'+seasonTbl('away')+'</div>'
     + '<div class="card"><h3>Confrontations directes</h3>'+h2h+'</div>'
-<<<<<<< ours
-<<<<<<< ours
     + '<div class="card wide"><h3>Contexte actuel</h3>'+contextCard(m)+'</div>'
-=======
->>>>>>> theirs
-=======
-    + '<div class="card wide"><h3>Contexte actuel</h3>'+contextCard(m)+'</div>'
->>>>>>> theirs
     + '<div class="card"><h3>Absences</h3>'+inj+'</div>'
     + '<div class="card"><h3>Compositions</h3>'+lu+'</div>'
     + '<div class="card"><h3>Avis API-Football</h3>'+ap+'</div>'
     + '</div></section>';
 }
 
-<<<<<<< ours
-<<<<<<< ours
-=======
->>>>>>> theirs
 function contextCard(m){
   if (!m.context || (!m.context.home && !m.context.away)) return '<p class="empty">Non collecté.</p>';
   const side = (label, c) => {
@@ -1074,34 +783,13 @@ function contextCard(m){
   return '<div class="grid" style="gap:14px">'+side(m.home.name, m.context.home)+side(m.away.name, m.context.away)+'</div>';
 }
 
-<<<<<<< ours
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
 function select(id){
   document.querySelectorAll('nav button').forEach(b=>b.setAttribute('aria-selected', b.dataset.id==id));
   document.querySelectorAll('section.match').forEach(s=>s.setAttribute('aria-hidden', s.id!=='m'+id));
   history.replaceState(null,'','#m'+id);
 }
 nav.addEventListener('click', e=>{ const b=e.target.closest('button'); if(b) select(b.dataset.id); });
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
 select((location.hash||'').slice(2) || (R.synthesis ? 'synth' : ranked[0]?.id));
-=======
-select((location.hash||'').slice(2) || ranked[0]?.id);
->>>>>>> theirs
-=======
-select((location.hash||'').slice(2) || (R.synthesis ? 'synth' : ranked[0]?.id));
->>>>>>> theirs
-=======
-select((location.hash||'').slice(2) || ranked[0]?.id);
->>>>>>> theirs
-=======
-select((location.hash||'').slice(2) || (R.synthesis ? 'synth' : ranked[0]?.id));
->>>>>>> theirs
 </script>
 </body>
 </html>`
@@ -1130,14 +818,6 @@ export async function run (args) {
     console.error('ok')
   }
 
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
   let synthesis = null
   if (args.llm && ANTHROPIC_KEY) {
     console.error(`\nWriting analyses with ${ANALYSIS_MODEL}…`)
@@ -1147,18 +827,6 @@ export async function run (args) {
   }
 
   const report = { date: args.date, generatedAt: new Date().toISOString(), args, matches, synthesis }
-<<<<<<< ours
-<<<<<<< ours
-=======
-  const report = { date: args.date, generatedAt: new Date().toISOString(), args, matches }
->>>>>>> theirs
-=======
->>>>>>> theirs
-=======
-  const report = { date: args.date, generatedAt: new Date().toISOString(), args, matches }
->>>>>>> theirs
-=======
->>>>>>> theirs
   await mkdir(args.out, { recursive: true })
   const htmlPath = path.join(args.out, `matchday-${args.date}.html`)
   const jsonPath = path.join(args.out, `matchday-${args.date}.json`)
