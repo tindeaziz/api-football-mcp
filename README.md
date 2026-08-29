@@ -1,3 +1,54 @@
+# API‑Football MCP Server
+
+A Model Context Protocol (MCP) server that provides Premier League data via API‑Sports’ API‑Football v3. Written in TypeScript with strict type checking, resilient error handling, and sensible caching for agent workflows.
+
+## Features
+
+- **Historical Coverage**: Premier League historical data (commonly 2002–present for many endpoints; some tools support 1992+ when data is available)
+- **Real-time Data**: Live match events, current standings, and fixture information
+- **Intelligent Caching**: LRU cache with TTL for optimal performance
+- **Rate Limiting**: Built-in rate‑limit tracking and exponential backoff
+- **MCP Integration**: Native Model Context Protocol support for LLM integration
+- **TypeScript**: Strict TypeScript (noUncheckedIndexedAccess, exactOptionalPropertyTypes)
+
+## MCP Tools
+
+### Hand-written tools (Premier League, formatted output)
+
+| Tool               | Description                                    | Parameters                                                         |
+| ------------------ | ---------------------------------------------- | ------------------------------------------------------------------ |
+| `get_standings`    | Get Premier League standings                   | `season?` (number)                                                 |
+| `get_fixtures`     | Get match fixtures                             | `season?`, `teamId?`, `date?`, `from?`, `to?`, `status?`, `round?` |
+| `get_team`         | Get team information and optional season squad | `teamId?` or `name?`, `season?`                                    |
+| `get_player`       | Get player profile and statistics              | `playerId?` or `name?`, `season?`                                  |
+| `get_match_goals`  | Get goal events for a match                    | `fixtureId` (required)                                             |
+| `get_match_events` | Get all events for a match                     | `fixtureId` (required)                                             |
+| `get_squad`        | Get a team's full season squad (all pages)     | `teamId` (required), `season` (required)                           |
+| `search_teams`     | Search for teams by name                       | `query?`, `season?`                                                |
+| `search_players`   | Search for players                             | `query` (required), `team?`, `season?`, `page?`                    |
+| `get_live_matches` | Get currently live matches                     | None                                                               |
+| `get_rate_limit`   | Get current API rate-limit status              | None                                                               |
+
+### Endpoint tools (full API-Football v3 coverage, raw JSON)
+
+Generated from `src/lib/tools/endpoint-specs.ts`. Each one returns the raw
+`response` array from API-Football plus the parameters used. `leagueId`
+defaults to `39` (Premier League) where applicable; pass another ID to query
+any competition your plan covers (use `get_leagues` to discover IDs and
+per-season coverage).
+
+| Group | Tools |
+| --- | --- |
+| General | `get_timezones`, `get_countries`, `get_seasons`, `get_leagues` |
+| Fixtures | `get_fixtures_by_ids` (≤20 fixtures with events/lineups/stats in one call), `get_fixture_rounds`, `get_head_to_head`, `get_fixture_statistics`, `get_fixture_lineups`, `get_fixture_player_stats` |
+| Teams | `get_team_statistics`, `get_team_seasons`, `get_team_countries`, `get_venues` |
+| Players | `get_player_seasons`, `get_player_profiles`, `get_player_teams`, `get_official_squad`, `get_top_scorers`, `get_top_assists`, `get_top_yellow_cards`, `get_top_red_cards`, `get_league_players` (paginated) |
+| Injuries & predictions | `get_injuries`, `get_predictions` |
+| Staff & careers | `get_coaches`, `get_transfers`, `get_trophies`, `get_sidelined` |
+| Odds | `get_odds`, `get_odds_mapping`, `get_odds_bookmakers`, `get_odds_bets`, `get_live_odds`, `get_live_odds_bets` |
+
+To add an endpoint, append a spec to `endpoint-specs.ts` — nothing else needs to change.
+
 ## Matchday report (all fixtures of a day, 4 leagues)
 
 ```bash
@@ -8,11 +59,556 @@ pnpm run report -- --date 2026-08-30 --seasons 5 --leagues 39,140 --bookmaker 8 
 Writes `reports/matchday-<date>.html` (tabbed page, matches ranked by the gap between a weighted
 Poisson model and the bookmaker's implied probabilities) plus the raw `.json`. Raw API responses
 are cached under `.cache/report/`, so re-running the same day is nearly free; `--refresh` forces
+<<<<<<< ours
+<<<<<<< ours
 new calls (use it ~1h before kick-off to pick up published lineups). Uses ~13 + 2×(seasons+1)
 API calls per fixture on the first run (team statistics per season, last-6 matches with xG,
 transfers, coach, standings and previous-season top scorers per league).
 
+<<<<<<< ours
+<<<<<<< ours
+=======
+>>>>>>> theirs
 Set `ANTHROPIC_API_KEY` to get a written analysis per match (verdict, main pick, alternative,
 what to avoid, reasoning) and a synthesis of the day, generated by Claude from the numbers with a
 fixed set of reading rules (see `READING_RULES` in the script). `ANALYSIS_MODEL` overrides the
 model; `--no-llm` skips the step. Without the key the page contains the numbers only.
+
+<<<<<<< ours
+=======
+>>>>>>> theirs
+=======
+>>>>>>> theirs
+=======
+new calls (use it ~1h before kick-off to pick up published lineups). Uses ~5 + 2×(seasons+1)
+API calls per fixture on the first run.
+=======
+new calls (use it ~1h before kick-off to pick up published lineups). Uses ~13 + 2×(seasons+1)
+API calls per fixture on the first run (team statistics per season, last-6 matches with xG,
+transfers, coach, standings and previous-season top scorers per league).
+>>>>>>> theirs
+
+<<<<<<< ours
+>>>>>>> theirs
+=======
+Set `ANTHROPIC_API_KEY` to get a written analysis per match (verdict, main pick, alternative,
+what to avoid, reasoning) and a synthesis of the day, generated by Claude from the numbers with a
+fixed set of reading rules (see `READING_RULES` in the script). `ANALYSIS_MODEL` overrides the
+model; `--no-llm` skips the step. Without the key the page contains the numbers only.
+
+>>>>>>> theirs
+## Data Coverage Notes
+
+- Historical coverage for the English Premier League via API‑Football v3 is commonly available from the 2002 season onwards. Earlier seasons (pre‑2002) may be incomplete or unavailable depending on the specific endpoint.
+- If you need season‑specific squads, use `season` with `get_team` (internally uses the `/players` endpoint) or the CLI `--endpoint squad team=<id> season=<YYYY>` helper, which aggregates every page and prints a compact table without photo URLs.
+- Fixture queries support `round` in the form `"Regular Season - N"` in addition to `season`, `date`, and `from`/`to`.
+
+## Installation
+
+### Prerequisites
+
+- Node.js 22+
+- pnpm package manager
+- API‑Football API key from [API‑Sports](https://api-sports.io/)
+
+### Setup
+
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/MarvDann/api-football-mcp.git
+   cd api-football-mcp
+   ```
+
+2. **Install dependencies**
+   ```bash
+   pnpm install
+   ```
+
+3. **Configure environment**
+   ```bash
+   # Set your API key as an environment variable
+   export API_FOOTBALL_KEY=your_api_key_here
+
+   # Or create a .env file
+   echo "API_FOOTBALL_KEY=your_api_key_here" > .env
+   ```
+
+4. **Build the project**
+   ```bash
+   pnpm run build
+   ```
+
+## Usage
+
+### As MCP Server
+
+The primary use case is as an MCP server for LLM integration:
+
+```bash
+# Start the MCP server
+pnpm start
+
+# Or run directly
+node dist/server.js
+```
+
+### MCP Client Configuration
+
+Below are example configurations for popular MCP-capable agents. All examples launch this server over stdio. Replace ${API_FOOTBALL_KEY} with your key or rely on your shell environment.
+
+- Claude Desktop (claude_desktop_config.json):
+```json
+{
+  "mcpServers": {
+    "api-football": {
+      "command": "node",
+      "args": ["dist/server.js"],
+      "env": {
+        "API_FOOTBALL_KEY": "${API_FOOTBALL_KEY}",
+        "NODE_ENV": "production",
+        "LOG_TO_FILE": "true",
+        "LOG_DIR": "./logs",
+        "LOG_ROTATE_INTERVAL": "1d"
+      }
+    }
+  }
+}
+```
+
+- Claude Code (VS Code settings.json):
+```json
+{
+  "claudeCode.mcpServers": [
+    {
+      "name": "api-football",
+      "command": "node",
+      "args": ["dist/server.js"],
+      "env": {
+        "API_FOOTBALL_KEY": "${API_FOOTBALL_KEY}",
+        "NODE_ENV": "production",
+        "LOG_TO_FILE": "true",
+        "LOG_DIR": "./logs"
+      }
+    }
+  ]
+}
+```
+
+- Cursor (settings JSON):
+```json
+{
+  "mcpServers": {
+    "api-football": {
+      "command": "node",
+      "args": ["dist/server.js"],
+      "env": {
+        "API_FOOTBALL_KEY": "${API_FOOTBALL_KEY}",
+        "NODE_ENV": "production",
+        "LOG_TO_FILE": "true",
+        "LOG_DIR": "./logs"
+      }
+    }
+  }
+}
+```
+
+- Gemini (CLI/desktop MCP support):
+```json
+{
+  "mcpServers": {
+    "api-football": {
+      "command": "node",
+      "args": ["dist/server.js"],
+      "env": {
+        "API_FOOTBALL_KEY": "${API_FOOTBALL_KEY}",
+        "NODE_ENV": "production",
+        "LOG_TO_FILE": "true",
+        "LOG_DIR": "./logs"
+      }
+    }
+  }
+}
+```
+
+- Codex CLI (local agent):
+```json
+{
+  "mcpServers": {
+    "api-football": {
+      "command": "node",
+      "args": ["dist/server.js"],
+      "env": {
+        "API_FOOTBALL_KEY": "${API_FOOTBALL_KEY}",
+        "NODE_ENV": "production",
+        "LOG_TO_FILE": "true",
+        "LOG_DIR": "./logs"
+      }
+    }
+  }
+}
+```
+
+Tools available to agents include: get_standings, get_fixtures, get_team, get_player, get_squad, get_match_goals, get_match_events, get_live_matches, search_teams, search_players, get_rate_limit.
+
+### CLI Tools
+
+#### Server Management
+```bash
+# Start server with custom settings
+node dist/cli/server.js start --log-level debug --verbose
+
+# Check server health
+node dist/cli/server.js health
+
+# Validate configuration
+node dist/cli/server.js validate --dry-run
+
+# List available MCP tools
+node dist/cli/server.js tools
+
+# Show cache statistics
+node dist/cli/server.js cache --verbose
+```
+
+#### API Client CLI
+```bash
+# Get current season standings
+node dist/cli/api-client.js --endpoint standings
+
+# Get fixtures for a specific date range
+node dist/cli/api-client.js --endpoint fixtures season=2023 from=2023-01-01 to=2023-01-31
+
+# Search for a team (table output includes venue details)
+node dist/cli/api-client.js --endpoint teams search="Arsenal"
+
+# Get detailed team info for a specific season
+node dist/cli/api-client.js --endpoint team id=42 season=2024
+
+# Get player information
+node dist/cli/api-client.js --endpoint player id=276 --format table
+
+# Get a club's full season squad (multi-page fetch, compact table without photo URLs)
+node dist/cli/api-client.js --endpoint squad team=33 season=2025
+
+# Get goal events for a fixture
+node dist/cli/api-client.js --endpoint goals fixture=123456 --format table
+
+# Check rate limit status
+node dist/cli/api-client.js --endpoint rate-limit --format table
+```
+
+#### Cache Management CLI
+```bash
+# View cache statistics
+node dist/cli/cache.js stats --format table
+
+# List cached keys
+node dist/cli/cache.js keys
+
+# Find keys by pattern
+node dist/cli/cache.js find "standings:*"
+
+# Clear cache
+node dist/cli/cache.js clear
+
+# Get specific cached value
+node dist/cli/cache.js get "standings:2023"
+```
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `API_FOOTBALL_KEY` | **Required**. Your API-Football API key | - |
+| `NODE_ENV` | Environment mode | `development` |
+| `LOG_LEVEL` | Logging level (debug, info, warn, error) | `info` |
+| `LOG_FORMAT` | Log format (json, text) | `json` |
+| `LOG_TO_FILE` | Enable file logging (pino) | `false` |
+| `LOG_DIR` | Directory for logs when `LOG_TO_FILE=true` | `./logs` |
+| `LOG_ROTATE_INTERVAL` | Rotation interval (when rotating transport available) | `1d` |
+| `LOG_ROTATE_SIZE` | Rotation size threshold (when available) | `10M` |
+| `CACHE_MAX_SIZE` | Maximum cache entries | `1000` |
+| `CACHE_TTL` | Cache TTL in milliseconds | `300000` (5 minutes) |
+| `API_TIMEOUT` | API request timeout in milliseconds | `15000` (15 seconds) |
+| `API_BASE_URL` | API-Football base URL | `https://v3.football.api-sports.io` |
+
+### Cache Policies
+
+The server uses different cache TTL values based on data type:
+
+- **Historical data** (past seasons): 24 hours
+- **Current season data**: 5 minutes
+- **Live match data**: 30 seconds
+- **Static data** (teams, players): 1 hour
+
+## Development
+
+### Scripts
+
+```bash
+# Development
+pnpm run dev          # Watch mode with hot reload
+pnpm run build        # Build TypeScript
+pnpm run lint:check   # Run ESLint (no fix)
+pnpm run lint         # Run ESLint with --fix
+pnpm run test         # Run all tests
+
+# Offline test suite (no real API calls)
+pnpm run test:offline   # unit + contract + performance (mocked)
+
+# Online tests (may hit API-Football; respect rate limits)
+pnpm run test:online
+
+# Run specific categories
+pnpm run test:unit
+pnpm run test:contract
+pnpm run test:performance
+pnpm run test:integration
+
+# Type checking
+pnpm run check-types  # Type check without emitting
+```
+
+### Project Structure
+
+```
+src/
+├── models/           # TypeScript interfaces
+│   ├── league.ts     # League data models
+│   ├── team.ts       # Team and venue models
+│   ├── player.ts     # Player and statistics models
+│   ├── fixture.ts    # Match and fixture models
+│   ├── standing.ts   # League standings models
+│   └── ...
+├── lib/
+│   ├── api-client/   # API-Football HTTP client
+│   ├── cache/        # LRU cache with TTL
+│   ├── tools/        # MCP tool implementations
+│   └── server/       # Structured logger + helpers
+├── services/         # Business logic layer
+├── cli/              # Command-line interfaces
+├── config.ts         # Configuration management
+└── server.ts         # MCP server entry (built to dist/server.js)
+
+tests/
+├── unit/             # Unit tests
+├── integration/      # Integration tests
+├── contract/         # API contract tests
+└── performance/      # Performance tests
+```
+
+### Testing
+
+The project follows Test-Driven Development (TDD):
+
+```bash
+# Run all tests
+pnpm test
+
+# Run specific test categories
+pnpm run test:unit
+pnpm run test:integration
+pnpm run test:contract
+pnpm run test:performance
+
+# Run tests in watch mode
+# Offline suite (does not require API key)
+pnpm run test:offline
+
+# Online tests (require API key, respect vendor rate limits)
+pnpm run test:online
+```
+
+### Code Quality
+
+- **ESLint**: Standard style (no semicolons, 2 spaces). In tests, unused vars and non‑null assertions are relaxed. In src, unused args prefixed with `_` are allowed.
+- **TypeScript**: Strict mode enabled
+- **Vitest**: Testing framework with coverage
+- **Automatic formatting**: ESLint autofix on save in VS Code
+
+## API Reference
+
+### Data Models
+
+#### Team
+```typescript
+interface Team {
+  id: number
+  name: string
+  code: string
+  country: string
+  founded: number
+  national: boolean
+  logo: string
+}
+```
+
+#### Player
+```typescript
+interface Player {
+  id: number
+  name: string
+  firstname: string
+  lastname: string
+  age: number
+  birth: {
+    date: string
+    place: string
+    country: string
+  }
+  nationality: string
+  height: string
+  weight: string
+  injured: boolean
+  photo: string
+}
+```
+
+#### Fixture
+```typescript
+interface Fixture {
+  id: number
+  referee: string
+  timezone: string
+  date: string
+  timestamp: number
+  periods: {
+    first: number
+    second: number
+  }
+  venue: {
+    id: number
+    name: string
+    city: string
+  }
+  status: {
+    long: string
+    short: string
+    elapsed: number
+  }
+}
+```
+
+## Rate Limiting
+
+The API-Football service has rate limits. The server handles this automatically:
+
+- **Reads rate limit headers** from API responses
+- **Implements exponential backoff** when limits are hit
+- **Queues requests** to respect rate limits
+- **Caches responses** to minimize API calls
+
+Rate limit status can be monitored via:
+```bash
+node dist/cli/api-client.js --endpoint rate-limit --format table
+```
+
+## Error Handling
+
+The server provides comprehensive error handling:
+
+- **MCP Error Codes**: Standard MCP error responses
+- **API Failures**: Graceful handling of API errors
+- **Cache Fallbacks**: Serve cached data when API is unavailable
+- **Request Validation**: Parameter validation before API calls
+- **Structured Logging**: Detailed error logging for debugging
+
+## Performance
+
+### Benchmarks
+
+- **Cache hits**: < 10ms response time
+- **Cache miss with API call**: < 200ms average
+- **Concurrent requests**: Supports 100+ concurrent requests
+- **Memory usage**: < 100MB typical usage
+
+### Optimization Features
+
+- **LRU Cache**: Automatic eviction of least-recently-used entries
+- **Connection pooling**: Reuse HTTP connections
+- **Compression**: Gzip compression for API responses
+- **Batch operations**: Multiple requests with concurrency control
+
+## Troubleshooting
+
+### Common Issues
+
+1. **API Key Invalid**
+   ```
+   Error: API key is required
+   ```
+   Solution: Set `API_FOOTBALL_KEY` environment variable
+
+2. **Rate Limit Exceeded**
+   ```
+   Warn: Rate limit hit, waiting 30000ms
+   ```
+   Solution: Server automatically handles this, wait for reset
+
+3. **Cache Performance**
+   ```bash
+   # Check cache statistics
+   node dist/cli/cache.js stats --format table
+
+   # Clear cache if needed
+   node dist/cli/cache.js clear
+   ```
+
+### Debug Mode
+
+Enable debug logging:
+```bash
+export LOG_LEVEL=debug
+pnpm start
+```
+
+## Contributing
+
+1. **Follow TDD**: Write tests before implementation
+2. **Code Style**: Use ESLint standard configuration
+3. **Type Safety**: Maintain strict TypeScript compliance
+4. **Documentation**: Update README for new features
+5. **Testing**: Ensure all tests pass before submitting
+
+### Pull Request Process
+
+1. Create feature branch from `main`
+2. Write tests for new functionality
+3. Implement features with TypeScript
+4. Run full test suite: `pnpm test`
+5. Check linting: `pnpm run lint`
+6. Submit pull request with description
+
+## Constitution & Governance
+
+This project follows an internal development constitution for MCP servers (.specify/memory/constitution.md):
+- Protocol: JSON‑RPC 2.0 over stdio via @modelcontextprotocol/sdk
+- TypeScript‑first, strict type safety across tools and client integration
+- Clear error formatting, retry with exponential backoff, and rate‑limit awareness
+- Documented tools, validated inputs, sanitized outputs, and caching strategy
+
+Please keep changes aligned with these principles.
+
+## License
+
+MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Support
+
+- **Issues**: Report bugs via [GitHub Issues](https://github.com/MarvDann/api-football-mcp/issues)
+- **API Reference**: [API-Football Documentation](https://www.api-football.com/documentation-v3)
+- **MCP Protocol**: [Model Context Protocol Specification](https://modelcontextprotocol.io/)
+
+---
+
+Built with ❤️ using TypeScript, Node.js, and the Model Context Protocol.
+- Rate Limiting for Agents
+  - Use the `get_rate_limit` tool to inspect the current limit, remaining, and recommended wait time.
+  - The server applies exponential backoff on 429 and tracks vendor headers. Tests space calls by ~3.5s.
+  - Best practices for agents:
+    - Batch related queries and cache where possible
+    - Pace calls (>= 3.5s apart) during exploration
+    - Handle 429 and retry after the suggested delay
+    - Prefer season filters to reduce payload sizes
