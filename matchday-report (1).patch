@@ -1,0 +1,880 @@
+From d2bab2cbc191f8bd0dc4a5dc669f1e5dcda0f9f1 Mon Sep 17 00:00:00 2001
+From: claude <claude@local>
+Date: Sat, 29 Aug 2026 20:32:50 +0000
+Subject: [PATCH 1/2] feat: matchday 360 report script (Poisson vs market, HTML
+ tabs)
+
+---
+ .gitignore                  |   4 +
+ README.md                   |  13 +
+ eslint.config.mjs           |   1 +
+ package.json                |   1 +
+ scripts/matchday-report.mjs | 525 ++++++++++++++++++++++++++++++++++++
+ 5 files changed, 544 insertions(+)
+ create mode 100644 scripts/matchday-report.mjs
+
+diff --git a/.gitignore b/.gitignore
+index 7722e88..660077a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -43,3 +43,7 @@ junit.xml
+ 
+ # Optional npm cache directory
+ .npm
++
++# matchday reports
++reports/
++.cache/
+diff --git a/README.md b/README.md
+index 58bf65e..9190679 100644
+--- a/README.md
++++ b/README.md
+@@ -49,6 +49,19 @@ per-season coverage).
+ 
+ To add an endpoint, append a spec to `endpoint-specs.ts` — nothing else needs to change.
+ 
++## Matchday report (all fixtures of a day, 4 leagues)
++
++```bash
++pnpm run report                                  # tomorrow, PL + Ligue 1 + Serie A + La Liga, 4 seasons
++pnpm run report -- --date 2026-08-30 --seasons 5 --leagues 39,140 --bookmaker 8 --refresh
++```
++
++Writes `reports/matchday-<date>.html` (tabbed page, matches ranked by the gap between a weighted
++Poisson model and the bookmaker's implied probabilities) plus the raw `.json`. Raw API responses
++are cached under `.cache/report/`, so re-running the same day is nearly free; `--refresh` forces
++new calls (use it ~1h before kick-off to pick up published lineups). Uses ~5 + 2×(seasons+1)
++API calls per fixture on the first run.
++
+ ## Data Coverage Notes
+ 
+ - Historical coverage for the English Premier League via API‑Football v3 is commonly available from the 2002 season onwards. Earlier seasons (pre‑2002) may be incomplete or unavailable depending on the specific endpoint.
+diff --git a/eslint.config.mjs b/eslint.config.mjs
+index f4d4e0d..bef1287 100644
+--- a/eslint.config.mjs
++++ b/eslint.config.mjs
+@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url'
+ const __dirname = dirname(fileURLToPath(import.meta.url))
+ 
+ export default tseslint.config(
++  { ignores: ['scripts/**', 'reports/**', '.cache/**'] },
+   eslint.configs.recommended,
+   ...tseslint.configs.strictTypeChecked,
+   ...tseslint.configs.stylisticTypeChecked,
+diff --git a/package.json b/package.json
+index d2b75c8..0fc6670 100644
+--- a/package.json
++++ b/package.json
+@@ -25,6 +25,7 @@
+     "cli:tools": "node dist/cli/tools.js",
+     "cli:server": "node dist/cli/server.js",
+     "start": "node dist/server.js",
++    "report": "node scripts/matchday-report.mjs",
+     "clean": "rm -rf dist"
+   },
+   "keywords": [
+diff --git a/scripts/matchday-report.mjs b/scripts/matchday-report.mjs
+new file mode 100644
+index 0000000..639e5e9
+--- /dev/null
++++ b/scripts/matchday-report.mjs
+@@ -0,0 +1,525 @@
++#!/usr/bin/env node
++/**
++ * Matchday 360° report — API-Football v3
++ *
++ * Usage:
++ *   node scripts/matchday-report.mjs [--date YYYY-MM-DD] [--seasons 4] [--leagues 39,61,135,140]
++ *                                    [--bookmaker 8] [--out reports/] [--refresh]
++ *
++ * Env: API_FOOTBALL_KEY (required)
++ *
++ * For every fixture of the day in the selected leagues, the script pulls:
++ *   predictions, odds (1N2 / over-under / BTTS), injuries, head-to-head,
++ *   lineups (if published), team statistics over N seasons for both clubs.
++ * It fits a weighted Poisson model, compares model probabilities with the
++ * bookmaker's implied probabilities (margin removed) and ranks fixtures by
++ * the largest gap ("edge"). Output: one self-contained HTML page.
++ *
++ * All raw API responses are cached on disk under .cache/report/ so a re-run
++ * on the same day costs almost no API calls. --refresh ignores the cache.
++ */
++
++import { mkdir, readFile, writeFile } from 'node:fs/promises'
++import { existsSync } from 'node:fs'
++import { createHash } from 'node:crypto'
++import path from 'node:path'
++import { fileURLToPath } from 'node:url'
++
++// ----------------------------------------------------------------- config
++
++const BASE = process.env.API_BASE_URL ?? 'https://v3.football.api-sports.io'
++const KEY = process.env.API_FOOTBALL_KEY
++const PACE_MS = Number(process.env.API_PACE_MS ?? 250) // Pro plan: 300 req/min
++
++export const LEAGUES = {
++  39: { name: 'Premier League', country: 'England', avgHome: 1.55, avgAway: 1.35 },
++  61: { name: 'Ligue 1', country: 'France', avgHome: 1.50, avgAway: 1.25 },
++  135: { name: 'Serie A', country: 'Italy', avgHome: 1.45, avgAway: 1.25 },
++  140: { name: 'La Liga', country: 'Spain', avgHome: 1.45, avgAway: 1.20 }
++}
++// avgHome/avgAway = typical goals per match for home/away sides in that league
++// (used to normalise attack/defence strengths). Adjust if you prefer to derive
++// them from data — see leagueAverages() below for a data-driven override.
++
++const SEASON_WEIGHTS = [1.0, 0.6, 0.35, 0.2, 0.1] // most recent complete season first
++const EDGE_FLAG = 0.05 // 5 points of probability = worth a look
++
++// ------------------------------------------------------------------- args
++
++function parseArgs (argv) {
++  const args = { seasons: 4, leagues: Object.keys(LEAGUES).map(Number), bookmaker: 8, out: 'reports', refresh: false }
++  for (let i = 0; i < argv.length; i++) {
++    const a = argv[i]
++    const next = () => argv[++i]
++    if (a === '--date') args.date = next()
++    else if (a === '--seasons') args.seasons = Number(next())
++    else if (a === '--leagues') args.leagues = next().split(',').map(Number)
++    else if (a === '--bookmaker') args.bookmaker = Number(next())
++    else if (a === '--out') args.out = next()
++    else if (a === '--refresh') args.refresh = true
++  }
++  if (!args.date) {
++    const d = new Date(); d.setUTCDate(d.getUTCDate() + 1)
++    args.date = d.toISOString().slice(0, 10)
++  }
++  return args
++}
++
++export function currentSeason (date = new Date()) {
++  return date.getUTCMonth() >= 6 ? date.getUTCFullYear() : date.getUTCFullYear() - 1 // July switch
++}
++
++// ------------------------------------------------------------------ client
++
++const sleep = (ms) => new Promise(r => setTimeout(r, ms))
++let lastCall = 0
++const cacheDir = path.join(process.cwd(), '.cache', 'report')
++
++async function api (endpoint, params, { ttlMs, refresh } = {}) {
++  const url = new URL(BASE + endpoint)
++  Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== null) url.searchParams.set(k, String(v)) })
++  const key = createHash('sha1').update(url.toString()).digest('hex').slice(0, 20)
++  const file = path.join(cacheDir, `${key}.json`)
++
++  if (!refresh && existsSync(file)) {
++    const cached = JSON.parse(await readFile(file, 'utf8'))
++    if (!ttlMs || Date.now() - cached.at < ttlMs) return cached.data
++  }
++
++  const wait = PACE_MS - (Date.now() - lastCall)
++  if (wait > 0) await sleep(wait)
++  lastCall = Date.now()
++
++  const res = await fetch(url, { headers: { 'x-apisports-key': KEY } })
++  const json = await res.json()
++  const errs = json.errors
++  if (errs && (Array.isArray(errs) ? errs.length : Object.keys(errs).length)) {
++    throw new Error(`${endpoint} ${JSON.stringify(params)} → ${JSON.stringify(errs)}`)
++  }
++  await mkdir(cacheDir, { recursive: true })
++  await writeFile(file, JSON.stringify({ at: Date.now(), data: json.response }))
++  return json.response
++}
++
++const HOUR = 3600_000
++const DAY = 24 * HOUR
++
++// ----------------------------------------------------------------- fetching
++
++async function collectFixture (fx, args) {
++  const id = fx.fixture.id
++  const league = fx.league.id
++  const home = fx.teams.home.id
++  const away = fx.teams.away.id
++  const opts = { refresh: args.refresh }
++
++  const [prediction, oddsRaw, injuries, h2h, lineups] = await Promise.all([
++    api('/predictions', { fixture: id }, { ttlMs: 6 * HOUR, ...opts }).then(r => r[0] ?? null).catch(e => ({ error: e.message })),
++    api('/odds', { fixture: id, bookmaker: args.bookmaker }, { ttlMs: 2 * HOUR, ...opts }).then(r => r[0] ?? null).catch(e => ({ error: e.message })),
++    api('/injuries', { fixture: id }, { ttlMs: 6 * HOUR, ...opts }).catch(() => []),
++    api('/fixtures/headtohead', { h2h: `${home}-${away}`, last: 10 }, { ttlMs: DAY, ...opts }).catch(() => []),
++    api('/fixtures/lineups', { fixture: id }, { ttlMs: HOUR, ...opts }).catch(() => [])
++  ])
++
++  const season = currentSeason(new Date(fx.fixture.date))
++  const seasons = Array.from({ length: args.seasons + 1 }, (_, i) => season - i) // current + N complete
++  const stats = {}
++  for (const team of [home, away]) {
++    stats[team] = {}
++    for (const s of seasons) {
++      const ttl = s < season ? 30 * DAY : 6 * HOUR
++      stats[team][s] = await api('/teams/statistics', { league, season: s, team }, { ttlMs: ttl, ...opts }).catch(() => null)
++    }
++  }
++  return { fixture: fx, prediction, odds: oddsRaw, injuries, h2h, lineups, stats, seasons }
++}
++
++// -------------------------------------------------------------------- model
++
++const num = (v) => (v === null || v === undefined ? 0 : Number(v))
++
++function rates (teamStats, side) {
++  // side = 'home' | 'away' ; returns { att, def, played }
++  if (!teamStats?.fixtures) return null
++  const played = num(teamStats.fixtures.played[side])
++  if (!played) return null
++  return {
++    att: num(teamStats.goals.for.total[side]) / played,
++    def: num(teamStats.goals.against.total[side]) / played,
++    played
++  }
++}
++
++function weightedRates (perSeason, seasons, side) {
++  // seasons[0] = current (partial). Weight it by games played (max 1 at 10 games),
++  // then complete seasons with SEASON_WEIGHTS.
++  let att = 0; let def = 0; let w = 0
++  seasons.forEach((s, i) => {
++    const r = rates(perSeason[s], side)
++    if (!r) return
++    const weight = i === 0 ? Math.min(1, r.played / 10) : (SEASON_WEIGHTS[i - 1] ?? 0.05)
++    att += r.att * weight; def += r.def * weight; w += weight
++  })
++  return w ? { att: att / w, def: def / w, weight: w } : null
++}
++
++function poisson (l, k) { let f = 1; for (let i = 2; i <= k; i++) f *= i; return Math.exp(-l) * l ** k / f }
++
++export function fitModel (data) {
++  const { fixture, stats, seasons } = data
++  const lg = LEAGUES[fixture.league.id] ?? { avgHome: 1.5, avgAway: 1.3 }
++  const home = fixture.teams.home.id; const away = fixture.teams.away.id
++  const H = weightedRates(stats[home], seasons, 'home')
++  const A = weightedRates(stats[away], seasons, 'away')
++  if (!H || !A) return null
++
++  const lambdaHome = (H.att / lg.avgHome) * (A.def / lg.avgAway) * lg.avgHome
++  const lambdaAway = (A.att / lg.avgAway) * (H.def / lg.avgHome) * lg.avgAway
++
++  const grid = []
++  let pH = 0; let pD = 0; let pA = 0; let over25 = 0; let btts = 0
++  for (let i = 0; i <= 7; i++) {
++    for (let j = 0; j <= 7; j++) {
++      const p = poisson(lambdaHome, i) * poisson(lambdaAway, j)
++      grid.push({ h: i, a: j, p })
++      if (i > j) pH += p; else if (i === j) pD += p; else pA += p
++      if (i + j > 2) over25 += p
++      if (i > 0 && j > 0) btts += p
++    }
++  }
++  grid.sort((x, y) => y.p - x.p)
++  return {
++    lambdaHome, lambdaAway,
++    probs: { home: pH, draw: pD, away: pA, over25, under25: 1 - over25, btts, noBtts: 1 - btts },
++    topScores: grid.slice(0, 5),
++    strengths: { home: H, away: A }
++  }
++}
++
++// -------------------------------------------------------------------- odds
++
++function implied (values) {
++  // values: [{value, odd}] -> normalised probabilities (margin removed) + raw odds
++  const raw = values.map(v => ({ label: v.value, odd: Number(v.odd), p: 1 / Number(v.odd) }))
++  const sum = raw.reduce((s, r) => s + r.p, 0)
++  return { margin: sum - 1, items: raw.map(r => ({ ...r, p: r.p / sum })) }
++}
++
++export function marketView (oddsRaw) {
++  if (!oddsRaw?.bookmakers?.[0]) return null
++  const bets = oddsRaw.bookmakers[0].bets
++  const find = (name) => bets.find(b => b.name === name)
++  const out = { bookmaker: oddsRaw.bookmakers[0].name, updated: oddsRaw.update }
++  const mw = find('Match Winner')
++  if (mw) out.matchWinner = implied(mw.values)
++  const ou = find('Goals Over/Under')
++  if (ou) {
++    const pair = ou.values.filter(v => v.value === 'Over 2.5' || v.value === 'Under 2.5')
++    if (pair.length === 2) out.over25 = implied(pair)
++  }
++  const bt = find('Both Teams Score')
++  if (bt) out.btts = implied(bt.values)
++  return out
++}
++
++export function edges (model, market) {
++  if (!model || !market) return []
++  const rows = []
++  const push = (label, modelP, item) => {
++    if (!item) return
++    rows.push({ label, model: modelP, market: item.p, odd: item.odd, edge: modelP - item.p, ev: modelP * item.odd - 1 })
++  }
++  const mw = market.matchWinner?.items ?? []
++  push('Home win', model.probs.home, mw.find(i => i.label === 'Home'))
++  push('Draw', model.probs.draw, mw.find(i => i.label === 'Draw'))
++  push('Away win', model.probs.away, mw.find(i => i.label === 'Away'))
++  const ou = market.over25?.items ?? []
++  push('Over 2.5', model.probs.over25, ou.find(i => i.label === 'Over 2.5'))
++  push('Under 2.5', model.probs.under25, ou.find(i => i.label === 'Under 2.5'))
++  const bt = market.btts?.items ?? []
++  push('Both teams score', model.probs.btts, bt.find(i => i.label === 'Yes'))
++  push('Not both score', model.probs.noBtts, bt.find(i => i.label === 'No'))
++  return rows.sort((a, b) => b.edge - a.edge)
++}
++
++// ---------------------------------------------------------------- summarise
++
++function seasonTable (perSeason, seasons) {
++  return seasons.map(s => {
++    const t = perSeason[s]
++    if (!t?.fixtures) return { season: s, played: 0 }
++    const f = t.fixtures
++    return {
++      season: s, played: f.played.total, w: f.wins.total, d: f.draws.total, l: f.loses.total,
++      gf: t.goals.for.total.total, ga: t.goals.against.total.total,
++      homeRecord: `${f.wins.home}-${f.draws.home}-${f.loses.home}`,
++      awayRecord: `${f.wins.away}-${f.draws.away}-${f.loses.away}`,
++      cleanSheets: t.clean_sheet?.total, failedToScore: t.failed_to_score?.total,
++      form: (t.form ?? '').slice(-10),
++      formation: t.lineups?.[0]?.formation
++    }
++  })
++}
++
++function h2hSummary (h2h, homeId) {
++  const done = h2h.filter(m => m.fixture.status.short === 'FT')
++  const rec = { homeTeamWins: 0, draws: 0, awayTeamWins: 0, goals: 0, matches: [] }
++  for (const m of done) {
++    const hg = m.goals.home; const ag = m.goals.away
++    const homeTeamIsHome = m.teams.home.id === homeId
++    const homeTeamGoals = homeTeamIsHome ? hg : ag; const otherGoals = homeTeamIsHome ? ag : hg
++    if (homeTeamGoals > otherGoals) rec.homeTeamWins++; else if (homeTeamGoals === otherGoals) rec.draws++; else rec.awayTeamWins++
++    rec.goals += hg + ag
++    rec.matches.push({ date: m.fixture.date.slice(0, 10), comp: m.league.name, home: m.teams.home.name, away: m.teams.away.name, score: `${hg}-${ag}` })
++  }
++  rec.avgGoals = done.length ? rec.goals / done.length : null
++  return rec
++}
++
++function injurySummary (injuries) {
++  return injuries.map(i => ({ team: i.team.name, player: i.player.name, type: i.player.type, reason: i.player.reason }))
++}
++
++function lineupSummary (lineups) {
++  return lineups.map(l => ({ team: l.team.name, formation: l.formation, coach: l.coach?.name, xi: (l.startXI ?? []).map(p => p.player.name) }))
++}
++
++export function analyse (data) {
++  const model = fitModel(data)
++  const market = marketView(data.odds)
++  const e = edges(model, market)
++  const fx = data.fixture
++  const apiPred = data.prediction?.predictions
++  return {
++    id: fx.fixture.id,
++    kickoff: fx.fixture.date,
++    league: { id: fx.league.id, name: fx.league.name, round: fx.league.round },
++    venue: fx.fixture.venue?.name,
++    home: { id: fx.teams.home.id, name: fx.teams.home.name, logo: fx.teams.home.logo },
++    away: { id: fx.teams.away.id, name: fx.teams.away.name, logo: fx.teams.away.logo },
++    model, market, edges: e,
++    bestEdge: e[0]?.edge ?? -1,
++    apiPrediction: apiPred ? { advice: apiPred.advice, percent: apiPred.percent, winner: apiPred.winner?.name } : null,
++    apiComparison: data.prediction?.comparison ?? null,
++    seasons: { home: seasonTable(data.stats[fx.teams.home.id], data.seasons), away: seasonTable(data.stats[fx.teams.away.id], data.seasons) },
++    h2h: h2hSummary(data.h2h, fx.teams.home.id),
++    injuries: injurySummary(data.injuries),
++    lineups: lineupSummary(data.lineups),
++    notes: [
++      data.prediction?.error ? `Prediction unavailable: ${data.prediction.error}` : null,
++      data.odds?.error ? `Odds unavailable: ${data.odds.error}` : null,
++      !model ? 'Model not fitted: insufficient season statistics for one of the teams (promoted club?)' : null,
++      model && model.strengths.home.weight < 1.2 ? 'Home side strengths rest on little history — treat with caution' : null,
++      model && model.strengths.away.weight < 1.2 ? 'Away side strengths rest on little history — treat with caution' : null
++    ].filter(Boolean)
++  }
++}
++
++// --------------------------------------------------------------------- html
++
++const pct = (p) => (p === undefined || p === null ? '—' : `${(p * 100).toFixed(0)}%`)
++const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
++
++export function renderHtml (report) {
++  const { date, generatedAt, matches, args } = report
++  const byLeague = {}
++  for (const m of matches) (byLeague[m.league.name] ??= []).push(m)
++  const json = JSON.stringify(report).replace(/</g, '\\u003c')
++
++  return `<!doctype html>
++<html lang="fr">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width,initial-scale=1">
++<title>Matchday ${date} — analyse 360°</title>
++<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;700;800&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
++<style>
++:root{
++  --paper:#EEF1F4;--card:#FFFFFF;--ink:#14213D;--ink-2:#4A5568;--rule:#CBD2DA;
++  --model:#14213D;--market:#2A9D8F;--edge:#F26430;--edge-soft:#FDE4DA;--ok:#2F855A;
++  --display:'Barlow Condensed',system-ui,sans-serif;--body:'IBM Plex Sans',system-ui,sans-serif;--mono:'IBM Plex Mono',monospace;
++}
++*{box-sizing:border-box}
++body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--body);font-size:14px;line-height:1.45}
++a{color:inherit}
++header{padding:28px 32px 18px;border-bottom:2px solid var(--ink);display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap}
++header h1{font-family:var(--display);font-weight:800;font-size:44px;letter-spacing:.5px;line-height:.95;margin:0;text-transform:uppercase}
++header h1 small{display:block;font-size:16px;font-weight:500;letter-spacing:2px;color:var(--ink-2)}
++.meta{font-family:var(--mono);font-size:12px;color:var(--ink-2);text-align:right}
++.disclaimer{margin:0;padding:12px 32px;background:var(--ink);color:#fff;font-size:13px}
++.disclaimer b{color:#FFB58A}
++main{display:grid;grid-template-columns:320px 1fr;min-height:calc(100vh - 140px)}
++nav{border-right:1px solid var(--rule);background:#F6F8FA;overflow:auto}
++nav h2{font-family:var(--display);font-size:13px;letter-spacing:2px;text-transform:uppercase;color:var(--ink-2);margin:18px 16px 6px;font-weight:700}
++nav button{display:block;width:100%;text-align:left;background:none;border:0;border-left:4px solid transparent;padding:10px 14px;cursor:pointer;font:inherit;color:var(--ink)}
++nav button:hover{background:#E9EDF1}
++nav button[aria-selected="true"]{background:#fff;border-left-color:var(--edge)}
++nav button:focus-visible{outline:2px solid var(--edge);outline-offset:-2px}
++nav .teams{font-weight:600}
++nav .sub{font-family:var(--mono);font-size:11px;color:var(--ink-2);display:flex;justify-content:space-between;margin-top:2px}
++.edge-pill{font-family:var(--mono);font-size:11px;padding:1px 6px;border-radius:3px;background:var(--edge-soft);color:#9A3412}
++.edge-pill.none{background:#E2E8F0;color:var(--ink-2)}
++section.match{display:none;padding:26px 32px 60px;max-width:1100px}
++section.match[aria-hidden="false"]{display:block}
++.title{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
++.title img{width:44px;height:44px;object-fit:contain}
++.title h2{font-family:var(--display);font-size:40px;font-weight:700;margin:0;text-transform:uppercase;line-height:1}
++.title .vs{font-family:var(--display);font-size:22px;color:var(--ink-2)}
++.kick{font-family:var(--mono);font-size:12px;color:var(--ink-2);margin:6px 0 22px}
++.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
++.card{background:var(--card);border:1px solid var(--rule);border-radius:6px;padding:16px 18px}
++.card h3{font-family:var(--display);font-size:15px;letter-spacing:1.5px;text-transform:uppercase;margin:0 0 12px;color:var(--ink-2);font-weight:700}
++.card.wide{grid-column:1/-1}
++/* signature: model bar with market ticks */
++.bar{position:relative;height:34px;border-radius:4px;overflow:hidden;display:flex;margin:6px 0 4px}
++.bar span{display:flex;align-items:center;justify-content:center;font-family:var(--display);font-weight:700;font-size:16px;color:#fff;min-width:0}
++.bar .h{background:var(--model)}.bar .d{background:#5A6B8C}.bar .a{background:#8A97B0}
++.ticks{position:relative;height:10px;margin-bottom:8px}
++.ticks i{position:absolute;top:0;width:2px;height:10px;background:var(--market)}
++.legend{font-family:var(--mono);font-size:11px;color:var(--ink-2);display:flex;gap:16px}
++.legend b{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
++table{width:100%;border-collapse:collapse;font-size:13px}
++th{font-family:var(--display);font-size:12px;letter-spacing:1px;text-transform:uppercase;color:var(--ink-2);text-align:left;padding:5px 6px;border-bottom:1px solid var(--rule);font-weight:700}
++td{padding:6px;border-bottom:1px solid #EDF0F3;font-family:var(--mono);font-size:12px;white-space:nowrap}
++td.txt{font-family:var(--body);font-size:13px;white-space:normal}
++tr.flag td{background:var(--edge-soft)}
++.pos{color:#9A3412;font-weight:600}.neg{color:var(--ink-2)}
++.note{background:#FFF7ED;border-left:3px solid var(--edge);padding:8px 12px;font-size:13px;margin-bottom:10px}
++.form{font-family:var(--mono);letter-spacing:2px}
++.form b{color:var(--ok)}.form i{color:var(--edge);font-style:normal}.form u{text-decoration:none;color:var(--ink-2)}
++.scores{display:flex;gap:10px;flex-wrap:wrap}
++.scores div{font-family:var(--display);font-size:22px;font-weight:700;padding:6px 12px;border:1px solid var(--rule);border-radius:4px}
++.scores div small{display:block;font-family:var(--mono);font-size:11px;font-weight:400;color:var(--ink-2)}
++.empty{color:var(--ink-2);font-style:italic}
++@media (max-width:900px){main{grid-template-columns:1fr}nav{border-right:0;border-bottom:1px solid var(--rule);max-height:40vh}.grid{grid-template-columns:1fr}section.match{padding:18px}header h1{font-size:32px}}
++@media (prefers-reduced-motion:no-preference){section.match[aria-hidden="false"]{animation:in .18s ease-out}@keyframes in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}}
++</style>
++</head>
++<body>
++<header>
++  <h1>Matchday ${esc(date)}<small>${matches.length} matchs · ${Object.keys(byLeague).length} championnats · ${args.seasons} saisons d'historique</small></h1>
++  <div class="meta">généré ${esc(generatedAt)}<br>cotes : ${esc(matches.find(m => m.market)?.market.bookmaker ?? '—')} · modèle : Poisson pondéré</div>
++</header>
++<p class="disclaimer"><b>Lecture.</b> L'edge est l'écart entre la probabilité du modèle et celle implicite dans la cote (marge retirée). Un edge positif signale un désaccord avec le marché, pas un pari gagnant : le modèle ignore les blessures, les transferts de l'été et les compositions tant qu'elles ne sont pas publiées. Le marché, lui, ne les ignore pas.</p>
++<main>
++<nav aria-label="Matchs" id="nav"></nav>
++<div id="panels"></div>
++</main>
++<script id="data" type="application/json">${json}</script>
++<script>
++const R = JSON.parse(document.getElementById('data').textContent);
++const pct = p => (p==null?'—':(p*100).toFixed(0)+'%');
++const esc = s => String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
++const nav = document.getElementById('nav'), panels = document.getElementById('panels');
++
++const ranked = [...R.matches].sort((a,b)=>b.bestEdge-a.bestEdge);
++const groups = {};
++for (const m of ranked) (groups[m.league.name] ??= []).push(m);
++
++nav.innerHTML = '<h2>Classés par edge</h2>' + ranked.map(m => navItem(m)).join('') +
++  Object.entries(groups).map(([lg, ms]) => '<h2>'+esc(lg)+'</h2>' + ms.map(navItem).join('')).join('');
++
++function navItem(m){
++  const e = m.bestEdge;
++  const pill = e>=0.05 ? '<span class="edge-pill">edge +'+(e*100).toFixed(0)+'</span>' : '<span class="edge-pill none">'+(e<0?'—':'+'+(e*100).toFixed(0))+'</span>';
++  return '<button role="tab" data-id="'+m.id+'"><div class="teams">'+esc(m.home.name)+' – '+esc(m.away.name)+'</div><div class="sub"><span>'+esc(m.league.name)+' · '+m.kickoff.slice(11,16)+'</span>'+pill+'</div></button>';
++}
++
++panels.innerHTML = R.matches.map(panel).join('');
++
++function form(s){ return '<span class="form">'+[...(s||'')].map(c=>c==='W'?'<b>W</b>':c==='L'?'<i>L</i>':'<u>D</u>').join('')+'</span>'; }
++
++function panel(m){
++  const md = m.model, mk = m.market;
++  const bar = md ? '<div class="bar"><span class="h" style="flex:'+md.probs.home+'">'+pct(md.probs.home)+'</span><span class="d" style="flex:'+md.probs.draw+'">'+pct(md.probs.draw)+'</span><span class="a" style="flex:'+md.probs.away+'">'+pct(md.probs.away)+'</span></div>'
++    + (mk?.matchWinner ? '<div class="ticks">'+(function(){const it=mk.matchWinner.items;const h=it.find(i=>i.label==='Home').p,d=it.find(i=>i.label==='Draw').p;return '<i style="left:'+(h*100)+'%"></i><i style="left:'+((h+d)*100)+'%"></i>'})()+'</div>' : '')
++    + '<div class="legend"><span><b style="background:var(--model)"></b>modèle : '+esc(m.home.name)+' / nul / '+esc(m.away.name)+'</span><span><b style="background:var(--market)"></b>repères du marché'+(mk?' ('+esc(mk.bookmaker)+', marge '+(mk.matchWinner.margin*100).toFixed(1)+'%)':'')+'</span></div>'
++    : '<p class="empty">Modèle non ajusté.</p>';
++
++  const edgeRows = m.edges.length ? '<table><tr><th>Pari</th><th>Modèle</th><th>Marché</th><th>Cote</th><th>Edge</th><th>EV</th></tr>'+m.edges.map(r=>'<tr class="'+(r.edge>=0.05?'flag':'')+'"><td class="txt">'+esc(r.label)+'</td><td>'+pct(r.model)+'</td><td>'+pct(r.market)+'</td><td>'+r.odd.toFixed(2)+'</td><td class="'+(r.edge>0?'pos':'neg')+'">'+(r.edge>=0?'+':'')+(r.edge*100).toFixed(1)+'</td><td class="'+(r.ev>0?'pos':'neg')+'">'+(r.ev>=0?'+':'')+(r.ev*100).toFixed(1)+'%</td></tr>').join('')+'</table>' : '<p class="empty">Pas de cotes disponibles pour ce match.</p>';
++
++  const scores = md ? '<div class="scores">'+md.topScores.map(s=>'<div>'+s.h+'–'+s.a+'<small>'+pct(s.p)+'</small></div>').join('')+'</div><p class="kick">buts attendus : '+md.lambdaHome.toFixed(2)+' – '+md.lambdaAway.toFixed(2)+' · +2,5 buts '+pct(md.probs.over25)+' · BTTS '+pct(md.probs.btts)+'</p>' : '';
++
++  const seasonTbl = side => '<table><tr><th>Saison</th><th>J</th><th>V-N-D</th><th>Buts</th><th>Dom</th><th>Ext</th><th>CS</th><th>Forme</th></tr>'+m.seasons[side].map(s=>s.played?'<tr><td>'+s.season+'-'+String(s.season+1).slice(2)+'</td><td>'+s.played+'</td><td>'+s.w+'-'+s.d+'-'+s.l+'</td><td>'+s.gf+':'+s.ga+'</td><td>'+s.homeRecord+'</td><td>'+s.awayRecord+'</td><td>'+(s.cleanSheets??'—')+'</td><td>'+form(s.form)+'</td></tr>':'<tr><td>'+s.season+'</td><td colspan="7" class="empty">pas dans cette division</td></tr>').join('')+'</table>';
++
++  const h = m.h2h;
++  const h2h = h.matches.length ? '<p class="kick" style="margin:0 0 8px">'+h.matches.length+' matchs · '+esc(m.home.name)+' '+h.homeTeamWins+' · nuls '+h.draws+' · '+esc(m.away.name)+' '+h.awayTeamWins+' · '+h.avgGoals.toFixed(1)+' buts/match</p><table>'+h.matches.map(x=>'<tr><td>'+x.date+'</td><td class="txt">'+esc(x.comp)+'</td><td class="txt">'+esc(x.home)+' – '+esc(x.away)+'</td><td>'+x.score+'</td></tr>').join('')+'</table>' : '<p class="empty">Aucune confrontation récente.</p>';
++
++  const inj = m.injuries.length ? '<table>'+m.injuries.map(i=>'<tr><td class="txt">'+esc(i.team)+'</td><td class="txt">'+esc(i.player)+'</td><td class="txt">'+esc(i.type)+' — '+esc(i.reason)+'</td></tr>').join('')+'</table>' : '<p class="empty">Aucune absence signalée.</p>';
++
++  const lu = m.lineups.length ? m.lineups.map(l=>'<p><b>'+esc(l.team)+'</b> '+esc(l.formation||'')+(l.coach?' · '+esc(l.coach):'')+'<br><span class="kick" style="margin:0">'+l.xi.map(esc).join(', ')+'</span></p>').join('') : '<p class="empty">Compositions non publiées (généralement ~1h avant le coup d\\'envoi — relancez le script avec --refresh).</p>';
++
++  const ap = m.apiPrediction ? '<p>'+esc(m.apiPrediction.advice)+'<br><span class="kick" style="margin:4px 0 0">'+esc(m.apiPrediction.percent.home)+' / '+esc(m.apiPrediction.percent.draw)+' / '+esc(m.apiPrediction.percent.away)+(m.apiComparison?' · comparatif total '+esc(m.apiComparison.total.home)+' – '+esc(m.apiComparison.total.away):'')+'</span></p>' : '<p class="empty">Indisponible.</p>';
++
++  return '<section class="match" role="tabpanel" id="m'+m.id+'" aria-hidden="true">'
++    + '<div class="title"><img src="'+m.home.logo+'" alt=""><h2>'+esc(m.home.name)+'</h2><span class="vs">vs</span><h2>'+esc(m.away.name)+'</h2><img src="'+m.away.logo+'" alt=""></div>'
++    + '<p class="kick">'+esc(m.league.name)+' · '+esc(m.league.round)+' · '+m.kickoff.replace('T',' ').slice(0,16)+' UTC'+(m.venue?' · '+esc(m.venue):'')+'</p>'
++    + m.notes.map(n=>'<div class="note">'+esc(n)+'</div>').join('')
++    + '<div class="grid">'
++    + '<div class="card wide"><h3>Modèle contre marché — 1N2</h3>'+bar+'</div>'
++    + '<div class="card"><h3>Écarts par pari</h3>'+edgeRows+'</div>'
++    + '<div class="card"><h3>Scores probables</h3>'+scores+'</div>'
++    + '<div class="card"><h3>'+esc(m.home.name)+' — historique</h3>'+seasonTbl('home')+'</div>'
++    + '<div class="card"><h3>'+esc(m.away.name)+' — historique</h3>'+seasonTbl('away')+'</div>'
++    + '<div class="card"><h3>Confrontations directes</h3>'+h2h+'</div>'
++    + '<div class="card"><h3>Absences</h3>'+inj+'</div>'
++    + '<div class="card"><h3>Compositions</h3>'+lu+'</div>'
++    + '<div class="card"><h3>Avis API-Football</h3>'+ap+'</div>'
++    + '</div></section>';
++}
++
++function select(id){
++  document.querySelectorAll('nav button').forEach(b=>b.setAttribute('aria-selected', b.dataset.id==id));
++  document.querySelectorAll('section.match').forEach(s=>s.setAttribute('aria-hidden', s.id!=='m'+id));
++  history.replaceState(null,'','#m'+id);
++}
++nav.addEventListener('click', e=>{ const b=e.target.closest('button'); if(b) select(b.dataset.id); });
++select((location.hash||'').slice(2) || ranked[0]?.id);
++</script>
++</body>
++</html>`
++}
++
++// --------------------------------------------------------------------- main
++
++export async function run (args) {
++  if (!KEY) throw new Error('API_FOOTBALL_KEY is not set')
++  console.error(`Matchday ${args.date} — leagues ${args.leagues.join(',')} — ${args.seasons} seasons`)
++
++  const fixtures = []
++  for (const league of args.leagues) {
++    const season = currentSeason(new Date(args.date))
++    const list = await api('/fixtures', { league, season, date: args.date }, { ttlMs: 6 * HOUR, refresh: args.refresh })
++    console.error(`  ${LEAGUES[league]?.name ?? league}: ${list.length} fixtures`)
++    fixtures.push(...list)
++  }
++  if (!fixtures.length) { console.error('No fixtures found for that date.'); return null }
++
++  const matches = []
++  for (const fx of fixtures) {
++    process.stderr.write(`  → ${fx.teams.home.name} – ${fx.teams.away.name} … `)
++    const data = await collectFixture(fx, args)
++    matches.push(analyse(data))
++    console.error('ok')
++  }
++
++  const report = { date: args.date, generatedAt: new Date().toISOString(), args, matches }
++  await mkdir(args.out, { recursive: true })
++  const htmlPath = path.join(args.out, `matchday-${args.date}.html`)
++  const jsonPath = path.join(args.out, `matchday-${args.date}.json`)
++  await writeFile(htmlPath, renderHtml(report))
++  await writeFile(jsonPath, JSON.stringify(report, null, 2))
++  console.error(`\nReport: ${htmlPath}\nData:   ${jsonPath}`)
++
++  const top = [...matches].sort((a, b) => b.bestEdge - a.bestEdge).slice(0, 5)
++  console.error('\nLargest model/market gaps:')
++  for (const m of top) {
++    const e = m.edges[0]
++    console.error(`  ${m.home.name} – ${m.away.name}: ${e ? `${e.label} model ${pct(e.model)} vs market ${pct(e.market)} (edge ${(e.edge * 100).toFixed(1)})` : 'no odds'}`)
++  }
++  return report
++}
++
++if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
++  run(parseArgs(process.argv.slice(2))).catch(err => { console.error(err.message); process.exit(1) })
++}
+-- 
+2.43.0
+
+
+From e846154ad25a097ca3d1f94713eb92aa30e498bd Mon Sep 17 00:00:00 2001
+From: claude <claude@local>
+Date: Sat, 29 Aug 2026 20:46:21 +0000
+Subject: [PATCH 2/2] feat(report): written analysis per match and day
+ synthesis via Claude API
+
+---
+ README.md                   |   5 ++
+ scripts/matchday-report.mjs | 152 ++++++++++++++++++++++++++++++++++--
+ 2 files changed, 151 insertions(+), 6 deletions(-)
+
+diff --git a/README.md b/README.md
+index 9190679..5111156 100644
+--- a/README.md
++++ b/README.md
+@@ -62,6 +62,11 @@ are cached under `.cache/report/`, so re-running the same day is nearly free; `-
+ new calls (use it ~1h before kick-off to pick up published lineups). Uses ~5 + 2×(seasons+1)
+ API calls per fixture on the first run.
+ 
++Set `ANTHROPIC_API_KEY` to get a written analysis per match (verdict, main pick, alternative,
++what to avoid, reasoning) and a synthesis of the day, generated by Claude from the numbers with a
++fixed set of reading rules (see `READING_RULES` in the script). `ANALYSIS_MODEL` overrides the
++model; `--no-llm` skips the step. Without the key the page contains the numbers only.
++
+ ## Data Coverage Notes
+ 
+ - Historical coverage for the English Premier League via API‑Football v3 is commonly available from the 2002 season onwards. Earlier seasons (pre‑2002) may be incomplete or unavailable depending on the specific endpoint.
+diff --git a/scripts/matchday-report.mjs b/scripts/matchday-report.mjs
+index 639e5e9..9b03ced 100644
+--- a/scripts/matchday-report.mjs
++++ b/scripts/matchday-report.mjs
+@@ -17,6 +17,11 @@
+  *
+  * All raw API responses are cached on disk under .cache/report/ so a re-run
+  * on the same day costs almost no API calls. --refresh ignores the cache.
++ *
++ * If ANTHROPIC_API_KEY is set, each match is also sent to Claude with the
++ * numbers above and a fixed set of reading rules; the returned French
++ * analysis (verdict, main pick, alternative, what to avoid, reasoning) and a
++ * day synthesis are embedded in the page. --no-llm skips this step.
+  */
+ 
+ import { mkdir, readFile, writeFile } from 'node:fs/promises'
+@@ -30,6 +35,8 @@ import { fileURLToPath } from 'node:url'
+ const BASE = process.env.API_BASE_URL ?? 'https://v3.football.api-sports.io'
+ const KEY = process.env.API_FOOTBALL_KEY
+ const PACE_MS = Number(process.env.API_PACE_MS ?? 250) // Pro plan: 300 req/min
++const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY
++const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL ?? 'claude-sonnet-5'
+ 
+ export const LEAGUES = {
+   39: { name: 'Premier League', country: 'England', avgHome: 1.55, avgAway: 1.35 },
+@@ -47,7 +54,7 @@ const EDGE_FLAG = 0.05 // 5 points of probability = worth a look
+ // ------------------------------------------------------------------- args
+ 
+ function parseArgs (argv) {
+-  const args = { seasons: 4, leagues: Object.keys(LEAGUES).map(Number), bookmaker: 8, out: 'reports', refresh: false }
++  const args = { seasons: 4, leagues: Object.keys(LEAGUES).map(Number), bookmaker: 8, out: 'reports', refresh: false, llm: true }
+   for (let i = 0; i < argv.length; i++) {
+     const a = argv[i]
+     const next = () => argv[++i]
+@@ -57,6 +64,7 @@ function parseArgs (argv) {
+     else if (a === '--bookmaker') args.bookmaker = Number(next())
+     else if (a === '--out') args.out = next()
+     else if (a === '--refresh') args.refresh = true
++    else if (a === '--no-llm') args.llm = false
+   }
+   if (!args.date) {
+     const d = new Date(); d.setUTCDate(d.getUTCDate() + 1)
+@@ -315,6 +323,102 @@ export function analyse (data) {
+   }
+ }
+ 
++
++// ---------------------------------------------------------------------- llm
++
++const READING_RULES = `Tu es un analyste de paris sportifs prudent et honnête. On te donne, pour un match,
++les chiffres d'un modèle de Poisson pondéré sur plusieurs saisons, les probabilités implicites du
++bookmaker (marge retirée), l'historique des deux clubs, les confrontations directes, les absences et
++les compositions si publiées. Tu écris en français, de façon directe, sans jargon inutile.
++
++Règles de lecture, à appliquer systématiquement :
++1. Le marché est la référence. Un écart modèle/marché de moins de 4 points n'est pas un edge.
++   Un écart de plus de 12 points sur le 1N2 est presque toujours une erreur du modèle, pas une
++   opportunité : cherche la cause (club avec peu de saisons dans la division, promu, mercato
++   lourd, adversaire dont le bilan extérieur biaise le calcul) et dis-le.
++2. Si la direction du modèle est plausible mais son ampleur suspecte, recommande la double chance
++   plutôt que la victoire sèche.
++3. Les absences comptent par poste et par nombre : 3-4 attaquants absents d'un côté pèse plus que
++   n'importe quel chiffre historique ; un milieu ou une charnière remaniés peuvent aussi bien ouvrir
++   le match que l'affaiblir — ne conclus pas dans un seul sens.
++4. Un club avec une seule saison de données (weight < 1.2) doit être lu avec ses vrais bilans
++   domicile/extérieur, pas avec les probabilités du modèle.
++5. Un Poisson simple surestime les totaux élevés et sous-estime les scores bas et les nuls. Un edge
++   à deux chiffres sur under/over ou BTTS est suspect ; un edge de 5 à 9 points sur un total,
++   appuyé par le profil des équipes (buts par match domicile/extérieur), peut être retenu.
++6. Une seule recommandation principale par match, une alternative, et ce qu'il faut éviter. Si rien
++   ne vaut un pari, dis-le : "pas de pari" est une réponse valable.
++7. Confiance sur 1 à 5. Un 4 ou 5 exige que le modèle, le marché et les absences convergent.
++8. Ne jamais présenter une probabilité comme une certitude ; un pari recommandé perd souvent.
++
++Réponds uniquement en JSON, sans texte autour, avec exactement ces clés :
++{"verdict": "une phrase", "confidence": 1-5, "mainPick": "pari + cote si connue", "altPick": "pari ou null",
++ "avoid": "ce qu'il ne faut pas jouer, ou null", "reasoning": "3 à 6 phrases, les faits qui pèsent, les réserves"}`
++
++const SYNTHESIS_RULES = `Tu reçois les lectures de tous les matchs du jour. Écris en français une synthèse
++en JSON : {"summary": "3 à 5 phrases sur la journée : où sont les vrais edges, où le modèle s'emballe, ce
++que le marché semble savoir", "ranked": [{"match": "Équipe A – Équipe B", "pick": "…", "confidence": 1-5,
++"why": "une phrase"}], "avoidToday": ["…"]}. Classe ranked par confiance décroissante puis par edge.
++Maximum 6 entrées dans ranked. Rappelle en une phrase finale que ce sont des opinions probabilistes.`
++
++async function claude (system, user, maxTokens = 1200) {
++  const res = await fetch('https://api.anthropic.com/v1/messages', {
++    method: 'POST',
++    headers: { 'content-type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
++    body: JSON.stringify({ model: ANALYSIS_MODEL, max_tokens: maxTokens, system, messages: [{ role: 'user', content: user }] })
++  })
++  const json = await res.json()
++  if (!res.ok) throw new Error(`Anthropic API ${res.status}: ${JSON.stringify(json.error ?? json)}`)
++  const text = json.content.filter(b => b.type === 'text').map(b => b.text).join('')
++  const clean = text.replace(/```json|```/g, '').trim()
++  return JSON.parse(clean)
++}
++
++function compactForLlm (m) {
++  // Strip logos and long lists; keep what the reading rules need.
++  return {
++    match: `${m.home.name} – ${m.away.name}`, league: m.league.name, kickoff: m.kickoff, venue: m.venue,
++    model: m.model ? {
++      expectedGoals: [m.model.lambdaHome, m.model.lambdaAway].map(x => +x.toFixed(2)),
++      probs: Object.fromEntries(Object.entries(m.model.probs).map(([k, v]) => [k, +(v * 100).toFixed(0)])),
++      topScores: m.model.topScores.map(s => `${s.h}-${s.a} ${(s.p * 100).toFixed(0)}%`),
++      dataWeight: { home: +m.model.strengths.home.weight.toFixed(2), away: +m.model.strengths.away.weight.toFixed(2) }
++    } : null,
++    market: m.market ? {
++      bookmaker: m.market.bookmaker,
++      matchWinner: m.market.matchWinner?.items.map(i => `${i.label} ${(i.p * 100).toFixed(0)}% @${i.odd}`),
++      over25: m.market.over25?.items.map(i => `${i.label} ${(i.p * 100).toFixed(0)}% @${i.odd}`),
++      btts: m.market.btts?.items.map(i => `${i.label} ${(i.p * 100).toFixed(0)}% @${i.odd}`)
++    } : null,
++    edges: m.edges.map(e => `${e.label}: modèle ${(e.model * 100).toFixed(0)} / marché ${(e.market * 100).toFixed(0)} / edge ${(e.edge * 100).toFixed(1)}`),
++    seasons: { home: m.seasons.home, away: m.seasons.away },
++    h2h: { record: `${m.h2h.homeTeamWins}-${m.h2h.draws}-${m.h2h.awayTeamWins}`, avgGoals: m.h2h.avgGoals, last: m.h2h.matches.slice(0, 6) },
++    injuries: m.injuries, lineups: m.lineups.map(l => ({ team: l.team, formation: l.formation, xi: l.xi })),
++    apiPrediction: m.apiPrediction, notes: m.notes
++  }
++}
++
++export async function narrate (matches) {
++  for (const m of matches) {
++    process.stderr.write(`  ✎ ${m.home.name} – ${m.away.name} … `)
++    try {
++      m.analysis = await claude(READING_RULES, JSON.stringify(compactForLlm(m)))
++      console.error('ok')
++    } catch (err) {
++      m.analysis = { error: err.message }
++      console.error(`failed (${err.message})`)
++    }
++  }
++  const digest = matches.filter(m => m.analysis && !m.analysis.error).map(m => ({
++    match: `${m.home.name} – ${m.away.name}`, league: m.league.name, bestEdge: +(m.bestEdge * 100).toFixed(1), ...m.analysis
++  }))
++  try {
++    return await claude(SYNTHESIS_RULES, JSON.stringify(digest), 1500)
++  } catch (err) {
++    return { error: err.message }
++  }
++}
++
+ // --------------------------------------------------------------------- html
+ 
+ const pct = (p) => (p === undefined || p === null ? '—' : `${(p * 100).toFixed(0)}%`)
+@@ -359,7 +463,7 @@ nav .teams{font-weight:600}
+ nav .sub{font-family:var(--mono);font-size:11px;color:var(--ink-2);display:flex;justify-content:space-between;margin-top:2px}
+ .edge-pill{font-family:var(--mono);font-size:11px;padding:1px 6px;border-radius:3px;background:var(--edge-soft);color:#9A3412}
+ .edge-pill.none{background:#E2E8F0;color:var(--ink-2)}
+-section.match{display:none;padding:26px 32px 60px;max-width:1100px}
++#panels{min-width:0}section.match{display:none;padding:26px 32px 60px;max-width:1100px;min-width:0}.card{min-width:0;overflow-x:auto}
+ section.match[aria-hidden="false"]{display:block}
+ .title{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+ .title img{width:44px;height:44px;object-fit:contain}
+@@ -391,6 +495,16 @@ tr.flag td{background:var(--edge-soft)}
+ .scores div{font-family:var(--display);font-size:22px;font-weight:700;padding:6px 12px;border:1px solid var(--rule);border-radius:4px}
+ .scores div small{display:block;font-family:var(--mono);font-size:11px;font-weight:400;color:var(--ink-2)}
+ .empty{color:var(--ink-2);font-style:italic}
++.read{border-left:4px solid var(--edge);background:#FFF9F5}
++.read .verdict{font-family:var(--display);font-size:22px;font-weight:700;line-height:1.15;margin:0 0 8px}
++.read .conf{font-family:var(--mono);font-size:11px;color:var(--ink-2);letter-spacing:1px}
++.read .conf b{color:var(--edge);letter-spacing:2px}
++.picks{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:12px 0}
++.picks div{background:#fff;border:1px solid var(--rule);border-radius:4px;padding:8px 10px}
++.picks small{display:block;font-family:var(--display);font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--ink-2)}
++.picks .main{border-color:var(--edge)}
++.synth ol{padding-left:20px}.synth li{margin-bottom:8px}
++@media (max-width:900px){.picks{grid-template-columns:1fr}}
+ @media (max-width:900px){main{grid-template-columns:1fr}nav{border-right:0;border-bottom:1px solid var(--rule);max-height:40vh}.grid{grid-template-columns:1fr}section.match{padding:18px}header h1{font-size:32px}}
+ @media (prefers-reduced-motion:no-preference){section.match[aria-hidden="false"]{animation:in .18s ease-out}@keyframes in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}}
+ </style>
+@@ -416,7 +530,7 @@ const ranked = [...R.matches].sort((a,b)=>b.bestEdge-a.bestEdge);
+ const groups = {};
+ for (const m of ranked) (groups[m.league.name] ??= []).push(m);
+ 
+-nav.innerHTML = '<h2>Classés par edge</h2>' + ranked.map(m => navItem(m)).join('') +
++nav.innerHTML = (R.synthesis ? '<h2>Journée</h2><button role="tab" data-id="synth"><div class="teams">Synthèse du jour</div><div class="sub"><span>lecture globale</span></div></button>' : '') + '<h2>Classés par edge</h2>' + ranked.map(m => navItem(m)).join('') +
+   Object.entries(groups).map(([lg, ms]) => '<h2>'+esc(lg)+'</h2>' + ms.map(navItem).join('')).join('');
+ 
+ function navItem(m){
+@@ -425,7 +539,24 @@ function navItem(m){
+   return '<button role="tab" data-id="'+m.id+'"><div class="teams">'+esc(m.home.name)+' – '+esc(m.away.name)+'</div><div class="sub"><span>'+esc(m.league.name)+' · '+m.kickoff.slice(11,16)+'</span>'+pill+'</div></button>';
+ }
+ 
+-panels.innerHTML = R.matches.map(panel).join('');
++panels.innerHTML = (R.synthesis ? synthPanel(R.synthesis) : '') + R.matches.map(panel).join('');
++
++function synthPanel(s){
++  if (s.error) return '<section class="match" id="msynth" aria-hidden="true"><div class="note">Synthèse indisponible : '+esc(s.error)+'</div></section>';
++  return '<section class="match synth" id="msynth" aria-hidden="true"><div class="title"><h2>Synthèse du jour</h2></div>'
++    + '<div class="card read"><p>'+esc(s.summary)+'</p></div>'
++    + '<div class="grid" style="margin-top:18px"><div class="card"><h3>Paris retenus, par confiance</h3><ol>'+(s.ranked||[]).map(r=>'<li><b>'+esc(r.match)+'</b> — '+esc(r.pick)+' <span class="conf"><b>'+'●'.repeat(r.confidence)+'○'.repeat(5-r.confidence)+'</b></span><br><span class="kick" style="margin:0">'+esc(r.why)+'</span></li>').join('')+'</ol></div>'
++    + '<div class="card"><h3>À éviter aujourd\\'hui</h3>'+((s.avoidToday||[]).length?'<ul>'+s.avoidToday.map(a=>'<li>'+esc(a)+'</li>').join('')+'</ul>':'<p class="empty">Rien de particulier.</p>')+'</div></div></section>';
++}
++
++function readCard(a){
++  if (!a) return '';
++  if (a.error) return '<div class="card wide read"><h3>Lecture</h3><p class="empty">Analyse indisponible : '+esc(a.error)+'</p></div>';
++  return '<div class="card wide read"><h3>Lecture</h3><p class="verdict">'+esc(a.verdict)+'</p>'
++    + '<div class="conf">confiance <b>'+'●'.repeat(a.confidence)+'○'.repeat(5-a.confidence)+'</b> '+a.confidence+'/5</div>'
++    + '<div class="picks"><div class="main"><small>Pari principal</small>'+esc(a.mainPick)+'</div><div><small>Alternative</small>'+(a.altPick?esc(a.altPick):'<span class="empty">aucune</span>')+'</div><div><small>À éviter</small>'+(a.avoid?esc(a.avoid):'<span class="empty">—</span>')+'</div></div>'
++    + '<p style="margin:0">'+esc(a.reasoning)+'</p></div>';
++}
+ 
+ function form(s){ return '<span class="form">'+[...(s||'')].map(c=>c==='W'?'<b>W</b>':c==='L'?'<i>L</i>':'<u>D</u>').join('')+'</span>'; }
+ 
+@@ -456,6 +587,7 @@ function panel(m){
+     + '<p class="kick">'+esc(m.league.name)+' · '+esc(m.league.round)+' · '+m.kickoff.replace('T',' ').slice(0,16)+' UTC'+(m.venue?' · '+esc(m.venue):'')+'</p>'
+     + m.notes.map(n=>'<div class="note">'+esc(n)+'</div>').join('')
+     + '<div class="grid">'
++    + readCard(m.analysis)
+     + '<div class="card wide"><h3>Modèle contre marché — 1N2</h3>'+bar+'</div>'
+     + '<div class="card"><h3>Écarts par pari</h3>'+edgeRows+'</div>'
+     + '<div class="card"><h3>Scores probables</h3>'+scores+'</div>'
+@@ -474,7 +606,7 @@ function select(id){
+   history.replaceState(null,'','#m'+id);
+ }
+ nav.addEventListener('click', e=>{ const b=e.target.closest('button'); if(b) select(b.dataset.id); });
+-select((location.hash||'').slice(2) || ranked[0]?.id);
++select((location.hash||'').slice(2) || (R.synthesis ? 'synth' : ranked[0]?.id));
+ </script>
+ </body>
+ </html>`
+@@ -503,7 +635,15 @@ export async function run (args) {
+     console.error('ok')
+   }
+ 
+-  const report = { date: args.date, generatedAt: new Date().toISOString(), args, matches }
++  let synthesis = null
++  if (args.llm && ANTHROPIC_KEY) {
++    console.error(`\nWriting analyses with ${ANALYSIS_MODEL}…`)
++    synthesis = await narrate(matches)
++  } else if (args.llm) {
++    console.error('\nANTHROPIC_API_KEY not set — numbers only, no written analysis (set the key or pass --no-llm to silence this).')
++  }
++
++  const report = { date: args.date, generatedAt: new Date().toISOString(), args, matches, synthesis }
+   await mkdir(args.out, { recursive: true })
+   const htmlPath = path.join(args.out, `matchday-${args.date}.html`)
+   const jsonPath = path.join(args.out, `matchday-${args.date}.json`)
+-- 
+2.43.0
+

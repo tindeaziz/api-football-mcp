@@ -43,3 +43,7 @@ junit.xml
 
 # Optional npm cache directory
 .npm
+
+# matchday reports
+reports/
+.cache/
