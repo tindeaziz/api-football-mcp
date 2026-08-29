@@ -18,3 +18,10 @@ services:
       --port 3000
       --streamableHttpPath /mcp
       --cors"
+
+    expose:
+      - "3000"
+
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.services.api-football-mcp.loadbalancer.server.port=3000"
