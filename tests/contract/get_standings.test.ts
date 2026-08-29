@@ -28,7 +28,11 @@ describe('Contract: get_standings tool', () => {
 
     expect(getStandingsTool.name).toBe(contract.name)
     expect(getStandingsTool.description).toBe(contract.description)
-    expect(getStandingsTool.inputSchema).toEqual(contract.inputSchema)
+    // The upper season bound is now computed from the calendar; compare everything else verbatim
+    const { maximum: _expectedMax, ...expectedSeason } = contract.inputSchema.properties.season
+    const { maximum: actualMax, ...actualSeason } = getStandingsTool.inputSchema.properties.season
+    expect(actualSeason).toEqual(expectedSeason)
+    expect(actualMax).toBeGreaterThanOrEqual(2025)
   })
 
   it('produces output that satisfies the contract schema', async () => {

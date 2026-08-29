@@ -13,19 +13,41 @@ A Model Context Protocol (MCP) server that provides Premier League data via API�
 
 ## MCP Tools
 
-| Tool | Description | Parameters |
-|------|-------------|------------|
-| `get_standings` | Get Premier League standings | `season?` (number) |
-| `get_fixtures` | Get match fixtures | `season?`, `teamId?`, `date?`, `from?`, `to?`, `status?`, `round?` |
-| `get_team` | Get team information and optional season squad | `teamId?` or `name?`, `season?` |
-| `get_player` | Get player profile and statistics | `playerId?` or `name?`, `season?` |
-| `get_match_goals` | Get goal events for a match | `fixtureId` (required) |
-| `get_match_events` | Get all events for a match | `fixtureId` (required) |
-| `get_squad` | Get a team's squad for a season | `teamId` (required), `season` (required) |
-| `search_teams` | Search for teams by name | `query?`, `season?` |
-| `search_players` | Search for players | `query` (required), `team?`, `season?`, `page?` |
-| `get_live_matches` | Get currently live matches | None |
-| `get_rate_limit` | Get current API rate-limit status | None |
+### Hand-written tools (Premier League, formatted output)
+
+| Tool               | Description                                    | Parameters                                                         |
+| ------------------ | ---------------------------------------------- | ------------------------------------------------------------------ |
+| `get_standings`    | Get Premier League standings                   | `season?` (number)                                                 |
+| `get_fixtures`     | Get match fixtures                             | `season?`, `teamId?`, `date?`, `from?`, `to?`, `status?`, `round?` |
+| `get_team`         | Get team information and optional season squad | `teamId?` or `name?`, `season?`                                    |
+| `get_player`       | Get player profile and statistics              | `playerId?` or `name?`, `season?`                                  |
+| `get_match_goals`  | Get goal events for a match                    | `fixtureId` (required)                                             |
+| `get_match_events` | Get all events for a match                     | `fixtureId` (required)                                             |
+| `get_squad`        | Get a team's full season squad (all pages)     | `teamId` (required), `season` (required)                           |
+| `search_teams`     | Search for teams by name                       | `query?`, `season?`                                                |
+| `search_players`   | Search for players                             | `query` (required), `team?`, `season?`, `page?`                    |
+| `get_live_matches` | Get currently live matches                     | None                                                               |
+| `get_rate_limit`   | Get current API rate-limit status              | None                                                               |
+
+### Endpoint tools (full API-Football v3 coverage, raw JSON)
+
+Generated from `src/lib/tools/endpoint-specs.ts`. Each one returns the raw
+`response` array from API-Football plus the parameters used. `leagueId`
+defaults to `39` (Premier League) where applicable; pass another ID to query
+any competition your plan covers (use `get_leagues` to discover IDs and
+per-season coverage).
+
+| Group | Tools |
+| --- | --- |
+| General | `get_timezones`, `get_countries`, `get_seasons`, `get_leagues` |
+| Fixtures | `get_fixtures_by_ids` (≤20 fixtures with events/lineups/stats in one call), `get_fixture_rounds`, `get_head_to_head`, `get_fixture_statistics`, `get_fixture_lineups`, `get_fixture_player_stats` |
+| Teams | `get_team_statistics`, `get_team_seasons`, `get_team_countries`, `get_venues` |
+| Players | `get_player_seasons`, `get_player_profiles`, `get_player_teams`, `get_official_squad`, `get_top_scorers`, `get_top_assists`, `get_top_yellow_cards`, `get_top_red_cards`, `get_league_players` (paginated) |
+| Injuries & predictions | `get_injuries`, `get_predictions` |
+| Staff & careers | `get_coaches`, `get_transfers`, `get_trophies`, `get_sidelined` |
+| Odds | `get_odds`, `get_odds_mapping`, `get_odds_bookmakers`, `get_odds_bets`, `get_live_odds`, `get_live_odds_bets` |
+
+To add an endpoint, append a spec to `endpoint-specs.ts` — nothing else needs to change.
 
 ## Data Coverage Notes
 

@@ -38,7 +38,7 @@ export class APIFootballClient {
         'x-ratelimit-requests-limit': '60',
         'x-ratelimit-requests-remaining': '60',
         'x-ratelimit-requests-reset': String(resetInSeconds)
-      } as Record<string, string>)
+      })
     }
   }
 
@@ -109,7 +109,7 @@ export class APIFootballClient {
         const errs = (data as { errors?: unknown }).errors
         const hasErrors = Array.isArray(errs)
           ? errs.length > 0
-          : (errs && typeof errs === 'object' && Object.keys(errs as Record<string, unknown>).length > 0)
+          : (errs && typeof errs === 'object' && Object.keys(errs).length > 0)
         if (hasErrors) {
           const message = Array.isArray(errs)
             ? errs.map(e => JSON.stringify(e)).join(', ')
@@ -139,6 +139,35 @@ export class APIFootballClient {
     }
 
     return withRetry(operation, this.retryConfig)
+  }
+
+  /**
+   * Generic request against any API-Football v3 endpoint.
+   * Used by the endpoint-driven tools (see lib/tools/endpoint-specs.ts).
+   */
+  async request<T = unknown> (
+    endpoint: string,
+    params: Record<string, string | number | boolean | undefined> = {}
+  ): Promise<ApiResponse<T>> {
+    return this.makeRequest<T>(endpoint, params)
+  }
+
+  /**
+   * Fetch every page of a paginated endpoint and concatenate the results.
+   */
+  async requestAllPages<T = unknown> (
+    endpoint: string,
+    params: Record<string, string | number | boolean | undefined> = {},
+    maxPages = 20
+  ): Promise<ApiResponse<T[]>> {
+    const first = await this.makeRequest<T[]>(endpoint, { ...params, page: 1 })
+    const total = Math.min(first.paging?.total ?? 1, maxPages)
+    const all: T[] = [...(first.response ?? [])]
+    for (let page = 2; page <= total; page++) {
+      const next = await this.makeRequest<T[]>(endpoint, { ...params, page })
+      all.push(...(next.response ?? []))
+    }
+    return { ...first, results: all.length, paging: { current: total, total }, response: all }
   }
 
   // Standings

@@ -12,6 +12,9 @@ import { SearchPlayersTool } from './search-players'
 import { GetLiveMatchesTool } from './get-live-matches'
 import { GetRateLimitTool } from './get-rate-limit'
 import { GetSquadTool } from './get-squad'
+import { GetMatchEventsTool } from './get-match-events'
+import { EndpointTool } from './endpoint-tool'
+import { ENDPOINT_SPECS } from './endpoint-specs'
 
 export interface ToolRegistryDependencies {
   apiClient: APIFootballClient
@@ -33,6 +36,12 @@ export class ToolRegistry {
     this.registerTool(new GetLiveMatchesTool(dependencies.apiClient, dependencies.cache))
     this.registerTool(new GetRateLimitTool(dependencies.apiClient, dependencies.cache))
     this.registerTool(new GetSquadTool(dependencies.apiClient, dependencies.cache))
+    this.registerTool(new GetMatchEventsTool(dependencies.apiClient, dependencies.cache))
+
+    // Every remaining API-Football v3 endpoint, generated from endpoint-specs.ts
+    for (const spec of ENDPOINT_SPECS) {
+      this.registerTool(new EndpointTool(spec, dependencies.apiClient, dependencies.cache))
+    }
   }
 
   private registerTool (tool: Tool): void {

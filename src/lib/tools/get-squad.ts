@@ -7,6 +7,7 @@ import { parsePlayer } from '../api-client/parser'
 import { getToolArguments } from './params'
 import { logger } from '../logger/logger'
 import { GetSquadResult, PlayerProfile } from '../../types/tool-results'
+import type { PlayersResponseItemAPI } from '../../types/api-football'
 
 export interface GetSquadParams {
   teamId: number
@@ -43,13 +44,14 @@ export class GetSquadTool implements Tool {
         }
       }
 
-      const cacheKey = CacheKeys.players({ team: params.teamId, season: params.season, page: 1 })
+      const cacheKey = CacheKeys.players({ team: params.teamId, season: params.season, page: 0 })
       const cached = this.cache.get(cacheKey)
       if (cached) {
         return { content: [{ type: 'text', text: JSON.stringify(cached, null, 2) }] }
       }
 
-      const apiResponse = await this.apiClient.getPlayers({ team: params.teamId, season: params.season, page: 1 })
+      // /players is paginated (~20 per page): aggregate every page so the full squad is returned
+      const apiResponse = await this.apiClient.requestAllPages<PlayersResponseItemAPI>('/players', { team: params.teamId, season: params.season })
 
       const squad: PlayerProfile[] = (apiResponse.response || []).map((playerData) => {
         const parsed = parsePlayer(playerData.player)
