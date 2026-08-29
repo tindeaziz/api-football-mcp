@@ -2,20 +2,20 @@ FROM node:22-alpine
 
 WORKDIR /app
 
-# Installer pnpm
-RUN corepack enable && corepack prepare pnpm@latest --activate
+# Active pnpm fourni avec Node.js/Corepack
+RUN corepack enable
 
-# Copier les manifests
-COPY package.json pnpm-lock.yaml ./
+# Copier uniquement les fichiers réellement présents dans le dépôt
+COPY package.json ./
 
 # Installer les dépendances
-RUN pnpm install --frozen-lockfile --prod
+RUN pnpm install
 
-# Copier le code
+# Copier le reste du code source
 COPY . .
 
-# Builder
+# Compiler le projet
 RUN pnpm run build
 
-# Point d'entrée
-ENTRYPOINT ["node", "dist/server.js"]
+# Démarrer le serveur MCP
+CMD ["node", "dist/server.js"]
