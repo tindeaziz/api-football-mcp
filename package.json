@@ -25,6 +25,7 @@
     "cli:tools": "node dist/cli/tools.js",
     "cli:server": "node dist/cli/server.js",
     "start": "node dist/server.js",
+    "settle": "node scripts/settle.mjs",
     "report": "node scripts/matchday-report.mjs",
     "clean": "rm -rf dist"
   },

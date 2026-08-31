@@ -36,13 +36,23 @@ const BASE = process.env.API_BASE_URL ?? 'https://v3.football.api-sports.io'
 const KEY = process.env.API_FOOTBALL_KEY
 const PACE_MS = Number(process.env.API_PACE_MS ?? 250) // Pro plan: 300 req/min
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY
-const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL ?? 'claude-sonnet-5'
+const DEEPSEEK_KEY = process.env.DEEPSEEK_API_KEY
+const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL ?? (ANTHROPIC_KEY ? 'claude-sonnet-5' : 'deepseek-chat')
+const PROVIDER = ANALYSIS_MODEL.toLowerCase().startsWith('deepseek') ? 'deepseek' : 'anthropic'
+const LLM_KEY = PROVIDER === 'deepseek' ? DEEPSEEK_KEY : ANTHROPIC_KEY
 
 export const LEAGUES = {
   39: { name: 'Premier League', country: 'England', avgHome: 1.55, avgAway: 1.35 },
   61: { name: 'Ligue 1', country: 'France', avgHome: 1.50, avgAway: 1.25 },
   135: { name: 'Serie A', country: 'Italy', avgHome: 1.45, avgAway: 1.25 },
-  140: { name: 'La Liga', country: 'Spain', avgHome: 1.45, avgAway: 1.20 }
+  140: { name: 'La Liga', country: 'Spain', avgHome: 1.45, avgAway: 1.20 },
+  78: { name: 'Bundesliga', country: 'Germany', avgHome: 1.75, avgAway: 1.45 },
+  88: { name: 'Eredivisie', country: 'Netherlands', avgHome: 1.75, avgAway: 1.40 },
+  40: { name: 'Championship', country: 'England', avgHome: 1.45, avgAway: 1.20 },
+  62: { name: 'Ligue 2', country: 'France', avgHome: 1.35, avgAway: 1.10 },
+  43: { name: 'National League', country: 'England', avgHome: 1.45, avgAway: 1.20 },
+  2: { name: 'Champions League', country: 'Europe', avgHome: 1.65, avgAway: 1.35, cup: true },
+  3: { name: 'Europa League', country: 'Europe', avgHome: 1.55, avgAway: 1.30, cup: true }
 }
 // avgHome/avgAway = typical goals per match for home/away sides in that league
 // (used to normalise attack/defence strengths). Adjust if you prefer to derive
@@ -94,12 +104,21 @@ async function api (endpoint, params, { ttlMs, refresh } = {}) {
     if (!ttlMs || Date.now() - cached.at < ttlMs) return cached.data
   }
 
-  const wait = PACE_MS - (Date.now() - lastCall)
-  if (wait > 0) await sleep(wait)
-  lastCall = Date.now()
-
-  const res = await fetch(url, { headers: { 'x-apisports-key': KEY } })
-  const json = await res.json()
+  let json
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const wait = PACE_MS - (Date.now() - lastCall)
+    if (wait > 0) await sleep(wait)
+    lastCall = Date.now()
+    try {
+      const res = await fetch(url, { headers: { 'x-apisports-key': KEY } })
+      json = await res.json()
+      break
+    } catch (err) {
+      const cause = err.cause?.code ?? err.message
+      if (attempt === 3) throw new Error(`network error on ${endpoint} (${cause})`)
+      await sleep(1500 * attempt)
+    }
+  }
   const errs = json.errors
   if (errs && (Array.isArray(errs) ? errs.length : Object.keys(errs).length)) {
     throw new Error(`${endpoint} ${JSON.stringify(params)} → ${JSON.stringify(errs)}`)
@@ -137,6 +156,8 @@ async function collectFixture (fx, args) {
     stats[team] = {}
     for (const s of seasons) {
       const ttl = s < season ? 30 * DAY : 6 * HOUR
+      // For cup fixtures a team's per-cup history is sparse (few matches, not every season);
+      // the thin-data fallback and the last-6 xG blend carry most of the weight there.
       stats[team][s] = await api('/teams/statistics', { league, season: s, team }, { ttlMs: ttl, ...opts }).catch(() => null)
     }
     context[team] = await collectTeamContext(team, season, opts)
@@ -151,15 +172,20 @@ async function collectFixture (fx, args) {
 }
 
 /** Recent matches with xG, summer transfers and current coach for one team. */
+const isFriendly = (f) => /friendl|amical|club friendlies|pre-season/i.test(f.league?.name ?? '') || f.league?.id === 667
+
 async function collectTeamContext (team, season, opts) {
-  const recentList = await api('/fixtures', { team, last: 6 }, { ttlMs: 6 * HOUR, ...opts }).catch(() => [])
+  // Ask for 10, keep the last 6 competitive ones (pre-season friendlies inflate xG and goals)
+  const recentList = await api('/fixtures', { team, last: 10 }, { ttlMs: 6 * HOUR, ...opts })
+    .then(r => r.filter(f => !isFriendly(f)).slice(0, 6)).catch(() => [])
   const ids = recentList.map(f => f.fixture.id)
   const recent = ids.length
     ? await api('/fixtures', { ids: ids.join('-') }, { ttlMs: 6 * HOUR, ...opts }).catch(() => recentList)
     : []
   const transfers = await api('/transfers', { team }, { ttlMs: DAY, ...opts }).then(r => r ?? []).catch(() => [])
   const coach = await api('/coachs', { team }, { ttlMs: DAY, ...opts }).then(r => r ?? []).catch(() => [])
-  return { recent, transfers, coach, season }
+  const squad = await api('/players/squads', { team }, { ttlMs: DAY, ...opts }).then(r => r?.[0]?.players ?? []).catch(() => [])
+  return { recent, transfers, coach, squad, season }
 }
 
 // -------------------------------------------------------------------- model
@@ -194,6 +220,27 @@ function weightedRates (perSeason, seasons, side) {
 function poisson (l, k) { let f = 1; for (let i = 2; i <= k; i++) f *= i; return Math.exp(-l) * l ** k / f }
 
 const RECENT_XG_WEIGHT = 0.3 // share of the strength taken from last-6 xG (venue-agnostic)
+const MIN_DATA_WEIGHT = 1.0 // below this, blend toward a generic promoted-side profile
+
+function promotedProfile (side, lg) {
+  // A typical newly promoted side: scores ~15% below and concedes ~25% above the league average
+  return side === 'home'
+    ? { att: lg.avgHome * 0.85, def: lg.avgAway * 1.25, weight: 0 }
+    : { att: lg.avgAway * 0.85, def: lg.avgHome * 1.25, weight: 0 }
+}
+
+function withFallback (base, side, lg) {
+  const fallback = promotedProfile(side, lg)
+  if (!base) return { ...fallback, fallback: 'no history in this division — generic promoted profile used' }
+  if (base.weight >= MIN_DATA_WEIGHT) return base
+  const w = base.weight / MIN_DATA_WEIGHT // 0..1 share of real data
+  return {
+    att: base.att * w + fallback.att * (1 - w),
+    def: base.def * w + fallback.def * (1 - w),
+    weight: base.weight,
+    fallback: `thin history (weight ${base.weight.toFixed(2)}) — blended ${Math.round((1 - w) * 100)}% with a generic promoted profile`
+  }
+}
 
 function blendRecent (base, recent, side, lg) {
   // recent: { xgFor, xgAgainst } per match over the last 6 games, any venue.
@@ -216,9 +263,8 @@ export function fitModel (data) {
   const { fixture, stats, seasons, context } = data
   const lg = LEAGUES[fixture.league.id] ?? { avgHome: 1.5, avgAway: 1.3 }
   const home = fixture.teams.home.id; const away = fixture.teams.away.id
-  let H = weightedRates(stats[home], seasons, 'home')
-  let A = weightedRates(stats[away], seasons, 'away')
-  if (!H || !A) return null
+  let H = withFallback(weightedRates(stats[home], seasons, 'home'), 'home', lg)
+  let A = withFallback(weightedRates(stats[away], seasons, 'away'), 'away', lg)
   const rh = recentForm(context?.[home]?.recent ?? [], home)
   const ra = recentForm(context?.[away]?.recent ?? [], away)
   H = blendRecent(H, rh, 'home', lg)
@@ -249,11 +295,14 @@ export function fitModel (data) {
 
 // -------------------------------------------------------------------- odds
 
-function implied (values) {
-  // values: [{value, odd}] -> normalised probabilities (margin removed) + raw odds
+function implied (values, { overlapping = false } = {}) {
+  // values: [{value, odd}] -> normalised probabilities (margin removed) + raw odds.
+  // Double-chance outcomes overlap (they sum to ~2), so their margin is removed per-outcome
+  // using the same factor as a fair 3-way book instead of renormalising to 1.
   const raw = values.map(v => ({ label: v.value, odd: Number(v.odd), p: 1 / Number(v.odd) }))
   const sum = raw.reduce((s, r) => s + r.p, 0)
-  return { margin: sum - 1, items: raw.map(r => ({ ...r, p: r.p / sum })) }
+  const target = overlapping ? 2 : 1
+  return { margin: sum - target, items: raw.map(r => ({ ...r, p: r.p / (sum / target) })) }
 }
 
 export function marketView (oddsRaw) {
@@ -270,6 +319,8 @@ export function marketView (oddsRaw) {
   }
   const bt = find('Both Teams Score')
   if (bt) out.btts = implied(bt.values)
+  const dc = find('Double Chance')
+  if (dc) out.doubleChance = implied(dc.values, { overlapping: true })
   return out
 }
 
@@ -290,6 +341,10 @@ export function edges (model, market) {
   const bt = market.btts?.items ?? []
   push('Both teams score', model.probs.btts, bt.find(i => i.label === 'Yes'))
   push('Not both score', model.probs.noBtts, bt.find(i => i.label === 'No'))
+  const dc = market.doubleChance?.items ?? []
+  push('Home or draw (1X)', model.probs.home + model.probs.draw, dc.find(i => /home\/draw|1x/i.test(i.label)))
+  push('Draw or away (X2)', model.probs.draw + model.probs.away, dc.find(i => /draw\/away|x2/i.test(i.label)))
+  push('Home or away (12)', model.probs.home + model.probs.away, dc.find(i => /home\/away|^12$/i.test(i.label)))
   return rows.sort((a, b) => b.edge - a.edge)
 }
 
@@ -365,30 +420,53 @@ export function recentForm (fixtures, teamId) {
   }
 }
 
-function transferSummary (transfersRaw, teamId, season) {
-  // API returns [{ player, transfers: [{date, type, teams:{in,out}}] }]
+function transferSummary (transfersRaw, teamId, season, squad = []) {
+  // API returns [{ player, transfers: [{date, type, teams:{in,out}}] }]. It also lists loan
+  // returns, youth moves and "N/A" entries, so an arrival only counts when the player is in
+  // today's official squad; departures only when he is not.
   const since = new Date(`${season}-06-01`)
+  const inSquad = new Set(squad.map(p => p.id))
   const arrivals = []; const departures = []
   for (const p of transfersRaw ?? []) {
     for (const t of p.transfers ?? []) {
       const d = new Date(t.date)
       if (Number.isNaN(d) || d < since) continue
-      const entry = { player: p.player?.name, date: t.date, type: t.type, from: t.teams?.out?.name, to: t.teams?.in?.name }
-      if (t.teams?.in?.id === teamId) arrivals.push(entry)
-      else if (t.teams?.out?.id === teamId) departures.push(entry)
+      const type = t.type ?? ''
+      if (/^n\/a$/i.test(type)) continue
+      const entry = { player: p.player?.name, date: t.date, type, from: t.teams?.out?.name, to: t.teams?.in?.name }
+      if (t.teams?.in?.id === teamId && inSquad.has(p.player?.id)) arrivals.push(entry)
+      else if (t.teams?.out?.id === teamId && !inSquad.has(p.player?.id)) departures.push(entry)
     }
   }
-  const key = (l) => l.filter(e => !/loan|prêt/i.test(e.type ?? '')).length // permanent = anything that is not a loan
-  return { arrivals: arrivals.length, departures: departures.length, permanentArrivals: key(arrivals), list: [...arrivals, ...departures].slice(0, 12) }
+  const permanent = (l) => l.filter(e => !/loan|prêt|return/i.test(e.type)).length
+  const squadSize = squad.length || null
+  const pa = permanent(arrivals)
+  return {
+    arrivals: arrivals.length, departures: departures.length, permanentArrivals: pa, squadSize,
+    turnover: squadSize ? +(pa / squadSize).toFixed(2) : null,
+    list: [...arrivals, ...departures].slice(0, 12)
+  }
 }
 
 function coachSummary (coachRaw, teamId, matchDate) {
-  const current = (coachRaw ?? []).find(c => c.team?.id === teamId) ?? coachRaw?.[0]
-  if (!current) return null
-  const spell = (current.career ?? []).find(c => c.team?.id === teamId && !c.end)
-  const start = spell?.start ? new Date(spell.start) : null
-  const days = start ? Math.round((new Date(matchDate) - start) / DAY) : null
-  return { name: current.name, since: spell?.start ?? null, daysInCharge: days, isNew: days !== null && days < 90 }
+  let best = null
+  for (const c of coachRaw ?? []) {
+    for (const spell of c.career ?? []) {
+      if (spell.team?.id !== teamId || spell.end) continue
+      const start = spell.start ? new Date(spell.start) : null
+      if (!best || (start && (!best.start || start > best.start))) best = { name: c.name, start }
+    }
+  }
+  if (!best) {
+    const c = (coachRaw ?? []).find(x => x.team?.id === teamId)
+    if (!c) return null
+    return { name: c.name, since: null, daysInCharge: null, isNew: false, uncertain: true }
+  }
+  const days = best.start ? Math.round((new Date(matchDate) - best.start) / DAY) : null
+  const since = best.start?.toISOString().slice(0, 10) ?? null
+  // API-Football dates intersaison appointments to July 1st: the day count is then nominal
+  const nominal = since !== null && /-07-01$/.test(since)
+  return { name: best.name, since, daysInCharge: days, isNew: days !== null && days < 90, appointedThisSummer: nominal && days !== null && days < 120 }
 }
 
 function standingSummary (standings, teamId) {
@@ -420,7 +498,7 @@ function teamContext (data, teamId) {
   return {
     standing: standingSummary(data.standings, teamId),
     recent: recentForm(c.recent ?? [], teamId),
-    transfers: transferSummary(c.transfers, teamId, season),
+    transfers: transferSummary(c.transfers, teamId, season, c.squad),
     coach: coachSummary(c.coach, teamId, data.fixture.fixture.date),
     keyPlayers: keyPlayerAbsences(data.topScorers, data.injuries, teamId)
   }
@@ -454,16 +532,16 @@ export function analyse (data) {
     notes: [
       data.prediction?.error ? `Prediction unavailable: ${data.prediction.error}` : null,
       data.odds?.error ? `Odds unavailable: ${data.odds.error}` : null,
-      !model ? 'Model not fitted: insufficient season statistics for one of the teams (promoted club?)' : null,
-      model && model.strengths.home.weight < 1.2 ? 'Home side strengths rest on little history — treat with caution' : null,
-      model && model.strengths.away.weight < 1.2 ? 'Away side strengths rest on little history — treat with caution' : null,
+      !model ? 'Model not fitted' : null,
+      model?.strengths.home.fallback ? `${fx.teams.home.name}: ${model.strengths.home.fallback}` : null,
+      model?.strengths.away.fallback ? `${fx.teams.away.name}: ${model.strengths.away.fallback}` : null,
       ...['home', 'away'].flatMap(side => {
         const t = side === 'home' ? fx.teams.home : fx.teams.away
         const c = data.context?.[t.id] ? teamContext(data, t.id) : null
         if (!c) return []
         const out = []
-        if (c.coach?.isNew) out.push(`${t.name}: new coach ${c.coach.name} (${c.coach.daysInCharge} days in charge) — history may not describe this team`)
-        if (c.transfers.permanentArrivals >= 6) out.push(`${t.name}: ${c.transfers.permanentArrivals} permanent summer arrivals — squad heavily rebuilt`)
+        if (c.coach?.isNew) out.push(`${t.name}: new coach ${c.coach.name} (${c.coach.appointedThisSummer ? 'appointed this summer' : `${c.coach.daysInCharge} days in charge`}) — history may not describe this team`)
+        if (c.transfers.turnover !== null ? c.transfers.turnover >= 0.35 : c.transfers.permanentArrivals >= 8) out.push(`${t.name}: ${c.transfers.permanentArrivals} permanent summer arrivals (${Math.round((c.transfers.turnover ?? 0) * 100)}% of the squad) — heavily rebuilt`)
         if (c.keyPlayers.absentKeyPlayers.length) out.push(`${t.name}: key scorer(s) absent — ${c.keyPlayers.absentKeyPlayers.map(p => `${p.name} (${p.goals} goals last season)`).join(', ')}`)
         if (c.recent.xgMatches && c.recent.xgFor !== null && c.recent.goalsFor !== null && c.recent.goalsFor - c.recent.xgFor > 0.6) out.push(`${t.name}: scoring well above xG recently (${c.recent.goalsFor} vs ${c.recent.xgFor}) — likely to regress`)
         if (c.recent.xgMatches && c.recent.xgFor !== null && c.recent.goalsFor !== null && c.recent.xgFor - c.recent.goalsFor > 0.6) out.push(`${t.name}: creating far more than it scores (xG ${c.recent.xgFor} vs ${c.recent.goalsFor} goals) — underperforming`)
@@ -488,45 +566,140 @@ Règles de lecture, à appliquer systématiquement :
    lourd, adversaire dont le bilan extérieur biaise le calcul) et dis-le.
 2. Si la direction du modèle est plausible mais son ampleur suspecte, recommande la double chance
    plutôt que la victoire sèche.
-3. Les absences comptent par poste et par nombre : 3-4 attaquants absents d'un côté pèse plus que
+3. Pour un match de coupe d'Europe, l'historique "dans cette compétition" est mince par nature :
+   appuie-toi d'abord sur la forme récente (xG), le classement domestique et les absences, et
+   traite les probabilités du modèle avec une réserve supplémentaire.
+4. Les absences comptent par poste et par nombre : 3-4 attaquants absents d'un côté pèse plus que
    n'importe quel chiffre historique ; un milieu ou une charnière remaniés peuvent aussi bien ouvrir
    le match que l'affaiblir — ne conclus pas dans un seul sens.
-4. Un club avec une seule saison de données (weight < 1.2) doit être lu avec ses vrais bilans
+5. Un club avec une seule saison de données (weight < 1.2) doit être lu avec ses vrais bilans
    domicile/extérieur, pas avec les probabilités du modèle.
-5. Un Poisson simple surestime les totaux élevés et sous-estime les scores bas et les nuls. Un edge
+6. Un Poisson simple surestime les totaux élevés et sous-estime les scores bas et les nuls. Un edge
    à deux chiffres sur under/over ou BTTS est suspect ; un edge de 5 à 9 points sur un total,
    appuyé par le profil des équipes (buts par match domicile/extérieur), peut être retenu.
-6. Une seule recommandation principale par match, une alternative, et ce qu'il faut éviter. Si rien
-   ne vaut un pari, dis-le : "pas de pari" est une réponse valable.
-7. Confiance sur 1 à 5. Un 4 ou 5 exige que le modèle, le marché et les absences convergent.
-8. Ne jamais présenter une probabilité comme une certitude ; un pari recommandé perd souvent.
-9. Le bloc "context" est prioritaire sur l'historique long : classement et forme actuels, xG des 6
+7. Une seule recommandation principale par match, une alternative, et ce qu'il faut éviter.
+   Le pari principal doit être pris dans la table "edges" fournie et avoir un edge d'au moins 4
+   points ; s'il n'en existe aucun, mainPick vaut exactement "Pas de pari" et confidence vaut 1.
+   Recommander un pari à edge nul "pour dire quelque chose" est une faute.
+8. Confiance sur 1 à 5. Un 4 ou 5 exige que le modèle, le marché et les absences convergent.
+9. Ne jamais présenter une probabilité comme une certitude ; un pari recommandé perd souvent.
+10. Un edge à deux chiffres est suspect sur toutes les lignes (1N2, double chance, totaux, BTTS),
+   pas seulement sur la victoire sèche. Si tu qualifies l'avantage du modèle sur une équipe
+   d'artefact, ne parie pas dans ce sens, même via la double chance : choisis une autre ligne ou
+   "Pas de pari".
+11. Cite toujours la cote réelle fournie (y compris pour la double chance) ; n'en invente jamais.
+12. Le bloc "context" est prioritaire sur l'historique long : classement et forme actuels, xG des 6
    derniers matchs (une équipe qui marque bien au-dessus de son xG va régresser ; l'inverse aussi),
-   effectif remanié (6 arrivées définitives ou plus = l'historique ne décrit plus l'équipe), coach
-   nommé depuis moins de 90 jours, et buteurs majeurs de la saison passée absents aujourd'hui.
+   effectif remanié (35 % de l'effectif arrivé cet été ou plus = l'historique ne décrit plus
+   l'équipe ; en dessous, un mercato normal), coach nommé cet été ou depuis moins de 90 jours, et buteurs majeurs de la saison passée absents aujourd'hui.
    Quand le contexte contredit le modèle, dis-le et suis le contexte.
 
 Réponds uniquement en JSON, sans texte autour, avec exactement ces clés :
-{"verdict": "une phrase", "confidence": 1-5, "mainPick": "pari + cote si connue", "altPick": "pari ou null",
- "avoid": "ce qu'il ne faut pas jouer, ou null", "reasoning": "3 à 6 phrases, les faits qui pèsent, les réserves"}`
+{"verdict": "une phrase", "confidence": 1-5, "mainPick": "pari + cote réelle, ou 'Pas de pari'",
+ "mainPickEdge": nombre (l'edge en points lu dans la table edges pour ce pari, 0 si Pas de pari),
+ "altPick": "pari ou null", "avoid": "ce qu'il ne faut pas jouer, ou null",
+ "reasoning": "3 à 6 phrases, les faits qui pèsent, les réserves"}`
 
 const SYNTHESIS_RULES = `Tu reçois les lectures de tous les matchs du jour. Écris en français une synthèse
 en JSON : {"summary": "3 à 5 phrases sur la journée : où sont les vrais edges, où le modèle s'emballe, ce
 que le marché semble savoir", "ranked": [{"match": "Équipe A – Équipe B", "pick": "…", "confidence": 1-5,
 "why": "une phrase"}], "avoidToday": ["…"]}. Classe ranked par confiance décroissante puis par edge.
-Maximum 6 entrées dans ranked. Rappelle en une phrase finale que ce sont des opinions probabilistes.`
+Maximum 6 entrées dans ranked ; n'y mets que des matchs dont mainPick n'est pas "Pas de pari".
+Rappelle en une phrase finale que ce sont des opinions probabilistes.`
 
-async function claude (system, user, maxTokens = 1200) {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: ANALYSIS_MODEL, max_tokens: maxTokens, system, messages: [{ role: 'user', content: user }] })
-  })
-  const json = await res.json()
-  if (!res.ok) throw new Error(`Anthropic API ${res.status}: ${JSON.stringify(json.error ?? json)}`)
-  const text = json.content.filter(b => b.type === 'text').map(b => b.text).join('')
-  const clean = text.replace(/```json|```/g, '').trim()
-  return JSON.parse(clean)
+async function llmFetch (url, options) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      return await fetch(url, options)
+    } catch (err) {
+      const cause = err.cause?.code ?? err.message
+      if (attempt === 3) throw new Error(`network error calling ${new URL(url).host} (${cause})`)
+      await sleep(1500 * attempt)
+    }
+  }
+}
+
+async function claude (system, user, maxTokens = 3000, attempt = 1) {
+  let text; let stopReason
+  if (PROVIDER === 'deepseek') {
+    const res = await llmFetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${DEEPSEEK_KEY}` },
+      body: JSON.stringify({
+        model: ANALYSIS_MODEL, max_tokens: maxTokens,
+        response_format: { type: 'json_object' },
+        messages: [{ role: 'system', content: system }, { role: 'user', content: user }]
+      })
+    })
+    const json = await res.json()
+    if (!res.ok) throw new Error(`DeepSeek API ${res.status}: ${JSON.stringify(json.error ?? json)}`)
+    text = json.choices?.[0]?.message?.content ?? ''
+    stopReason = json.choices?.[0]?.finish_reason
+  } else {
+    const res = await llmFetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: ANALYSIS_MODEL, max_tokens: maxTokens, system,
+        messages: [{ role: 'user', content: user }]
+      })
+    })
+    const json = await res.json()
+    if (!res.ok) throw new Error(`Anthropic API ${res.status}: ${JSON.stringify(json.error ?? json)}`)
+    text = (json.content ?? []).filter(b => b.type === 'text').map(b => b.text).join('')
+    stopReason = json.stop_reason
+  }
+  const parsed = extractJson(text)
+  if (parsed) return parsed
+
+  await mkdir(cacheDir, { recursive: true })
+  await writeFile(path.join(cacheDir, `llm-fail-${Date.now()}.txt`), `provider=${PROVIDER} stop_reason=${stopReason}\n\n${text}`)
+  if (attempt < 2) {
+    // Truncated or malformed: retry once with more room and a stricter reminder
+    return claude(system + '\n\nRéponds avec un seul objet JSON compact, sans retour à la ligne dans les valeurs.', user, maxTokens + 1500, attempt + 1)
+  }
+  const err = new Error(`invalid JSON after ${attempt} attempts (stop_reason=${stopReason}); raw saved in .cache/report/llm-fail-*.txt`)
+  err.rawText = text
+  throw err
+}
+
+function extractJson (text) {
+  const cleaned = text.replace(/```json|```/g, '').trim()
+  const start = cleaned.indexOf('{'); const end = cleaned.lastIndexOf('}')
+  if (start === -1 || end === -1 || end <= start) return null
+  const candidate = cleaned.slice(start, end + 1)
+  try { return JSON.parse(candidate) } catch { /* try a lenient repair below */ }
+  // Common model slips: trailing commas, unescaped newlines inside strings
+  const repaired = candidate
+    .replace(/,\s*([}\]])/g, '$1')
+    .replace(/(?<=:\s*"[^"]*)\n(?=[^"]*")/g, ' ')
+  try { return JSON.parse(repaired) } catch { return null }
+}
+
+const NO_BET = /^pas de pari/i
+
+function checkAnalysis (m) {
+  // Cross-check the written pick against the numbers; returns human-readable flags.
+  const a = m.analysis; const flags = []
+  if (!a || a.error) return flags
+  if (NO_BET.test(a.mainPick ?? '')) return flags
+  const edge = Number(a.mainPickEdge)
+  if (!Number.isFinite(edge)) flags.push('Edge du pari principal non renseigné par l\'analyse.')
+  else if (edge < 4) flags.push(`Pari principal retenu avec un edge de ${edge.toFixed(1)} point(s) — sous le seuil de 4 : à considérer comme "pas de pari".`)
+  // Does the stated pick correspond to a line the model actually flagged?
+  const t = (a.mainPick ?? '').toLowerCase()
+  const best = m.edges.filter(e => e.edge >= 0.04).map(e => e.label.toLowerCase())
+  const matches = best.some(l =>
+    (l.includes('over') && /plus de|over/.test(t)) || (l.includes('under') && /moins de|under/.test(t)) ||
+    (l.includes('both teams') && /btts|deux équipes|both teams/.test(t) && !/\bnon\b|\bno\b|ne marquent pas/.test(t)) ||
+    (l.includes('not both') && /btts|deux équipes|both teams/.test(t) && /\bnon\b|\bno\b|ne marquent pas/.test(t)) ||
+    (l.includes('1x') && /1x|ou nul/.test(t) && t.includes(m.home.name.toLowerCase().slice(0, 5))) ||
+    (l.includes('x2') && /x2|nul ou/.test(t)) ||
+    (l === 'home win' && t.includes(m.home.name.toLowerCase().slice(0, 5)) && !/ou nul|1x/.test(t)) ||
+    (l === 'away win' && t.includes(m.away.name.toLowerCase().slice(0, 5)) && !/nul ou|x2/.test(t)) ||
+    (l === 'draw' && /^nul|match nul/.test(t)))
+  if (best.length && !matches) flags.push('Le pari principal ne correspond à aucune ligne à edge ≥ 4 points dans la table.')
+  return flags
 }
 
 function compactForLlm (m) {
@@ -543,7 +716,8 @@ function compactForLlm (m) {
       bookmaker: m.market.bookmaker,
       matchWinner: m.market.matchWinner?.items.map(i => `${i.label} ${(i.p * 100).toFixed(0)}% @${i.odd}`),
       over25: m.market.over25?.items.map(i => `${i.label} ${(i.p * 100).toFixed(0)}% @${i.odd}`),
-      btts: m.market.btts?.items.map(i => `${i.label} ${(i.p * 100).toFixed(0)}% @${i.odd}`)
+      btts: m.market.btts?.items.map(i => `${i.label} ${(i.p * 100).toFixed(0)}% @${i.odd}`),
+      doubleChance: m.market.doubleChance?.items.map(i => `${i.label} ${(i.p * 100).toFixed(0)}% @${i.odd}`)
     } : null,
     edges: m.edges.map(e => `${e.label}: modèle ${(e.model * 100).toFixed(0)} / marché ${(e.market * 100).toFixed(0)} / edge ${(e.edge * 100).toFixed(1)}`),
     seasons: { home: m.seasons.home, away: m.seasons.away },
@@ -569,9 +743,10 @@ export async function narrate (matches) {
     process.stderr.write(`  ✎ ${m.home.name} – ${m.away.name} … `)
     try {
       m.analysis = await claude(READING_RULES, JSON.stringify(compactForLlm(m)))
-      console.error('ok')
+      m.analysis.checks = checkAnalysis(m)
+      console.error(m.analysis.checks.length ? `ok (${m.analysis.checks.length} flag)` : 'ok')
     } catch (err) {
-      m.analysis = { error: err.message }
+      m.analysis = { error: err.message, raw: err.rawText ? err.rawText.slice(0, 1200) : null }
       console.error(`failed (${err.message})`)
     }
   }
@@ -579,7 +754,7 @@ export async function narrate (matches) {
     match: `${m.home.name} – ${m.away.name}`, league: m.league.name, bestEdge: +(m.bestEdge * 100).toFixed(1), ...m.analysis
   }))
   try {
-    return await claude(SYNTHESIS_RULES, JSON.stringify(digest), 1500)
+    return await claude(SYNTHESIS_RULES, JSON.stringify(digest), 3000)
   } catch (err) {
     return { error: err.message }
   }
@@ -602,83 +777,93 @@ export function renderHtml (report) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Matchday ${date} — analyse 360°</title>
-<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;700;800&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Roboto+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
 :root{
-  --paper:#EEF1F4;--card:#FFFFFF;--ink:#14213D;--ink-2:#4A5568;--rule:#CBD2DA;
-  --model:#14213D;--market:#2A9D8F;--edge:#F26430;--edge-soft:#FDE4DA;--ok:#2F855A;
-  --display:'Barlow Condensed',system-ui,sans-serif;--body:'IBM Plex Sans',system-ui,sans-serif;--mono:'IBM Plex Mono',monospace;
+  --red:#E4002B;--red-dark:#B80022;--black:#111111;--grey-1:#F5F5F7;--grey-2:#E8E8EC;--grey-3:#8A8A93;--text:#1B1B1F;--text-2:#5C5C66;
+  --odd-bg:#FFFFFF;--odd-border:#D9D9DE;--pick:#FFE600;--model:#111111;--market:#00A86B;--edge:#E4002B;--edge-soft:#FDE7EA;
+  --body:'Inter',system-ui,sans-serif;--mono:'Roboto Mono',monospace;
 }
 *{box-sizing:border-box}
-body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--body);font-size:14px;line-height:1.45}
-a{color:inherit}
-header{padding:28px 32px 18px;border-bottom:2px solid var(--ink);display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap}
-header h1{font-family:var(--display);font-weight:800;font-size:44px;letter-spacing:.5px;line-height:.95;margin:0;text-transform:uppercase}
-header h1 small{display:block;font-size:16px;font-weight:500;letter-spacing:2px;color:var(--ink-2)}
-.meta{font-family:var(--mono);font-size:12px;color:var(--ink-2);text-align:right}
-.disclaimer{margin:0;padding:12px 32px;background:var(--ink);color:#fff;font-size:13px}
-.disclaimer b{color:#FFB58A}
-main{display:grid;grid-template-columns:320px 1fr;min-height:calc(100vh - 140px)}
-nav{border-right:1px solid var(--rule);background:#F6F8FA;overflow:auto}
-nav h2{font-family:var(--display);font-size:13px;letter-spacing:2px;text-transform:uppercase;color:var(--ink-2);margin:18px 16px 6px;font-weight:700}
-nav button{display:block;width:100%;text-align:left;background:none;border:0;border-left:4px solid transparent;padding:10px 14px;cursor:pointer;font:inherit;color:var(--ink)}
-nav button:hover{background:#E9EDF1}
-nav button[aria-selected="true"]{background:#fff;border-left-color:var(--edge)}
-nav button:focus-visible{outline:2px solid var(--edge);outline-offset:-2px}
-nav .teams{font-weight:600}
-nav .sub{font-family:var(--mono);font-size:11px;color:var(--ink-2);display:flex;justify-content:space-between;margin-top:2px}
-.edge-pill{font-family:var(--mono);font-size:11px;padding:1px 6px;border-radius:3px;background:var(--edge-soft);color:#9A3412}
-.edge-pill.none{background:#E2E8F0;color:var(--ink-2)}
-#panels{min-width:0}section.match{display:none;padding:26px 32px 60px;max-width:1100px;min-width:0}.card{min-width:0;overflow-x:auto}
+body{margin:0;background:var(--grey-1);color:var(--text);font-family:var(--body);font-size:14px;line-height:1.45}
+/* top bar */
+header{background:var(--red);color:#fff;padding:0 24px;height:56px;display:flex;align-items:center;justify-content:space-between;gap:16px}
+header h1{font-size:18px;font-weight:800;letter-spacing:.2px;margin:0;display:flex;align-items:center;gap:12px}
+header h1 small{font-weight:500;font-size:12px;opacity:.85;letter-spacing:0}
+.meta{font-family:var(--mono);font-size:11px;opacity:.9;text-align:right}
+.disclaimer{margin:0;padding:8px 24px;background:var(--black);color:#ddd;font-size:12px}
+.disclaimer b{color:#fff}
+main{display:grid;grid-template-columns:400px 1fr;min-height:calc(100vh - 92px)}
+/* match list, bookmaker style */
+nav{background:#fff;border-right:1px solid var(--grey-2);overflow:auto}
+nav h2{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:#fff;background:var(--black);margin:0;padding:8px 14px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:1}
+nav h2 span{font-weight:500;font-family:var(--mono);font-size:10px;opacity:.7;text-transform:none;letter-spacing:0}
+nav button{display:grid;grid-template-columns:1fr auto;gap:8px;width:100%;text-align:left;background:#fff;border:0;border-bottom:1px solid var(--grey-2);padding:10px 14px;cursor:pointer;font:inherit;color:var(--text);align-items:center}
+nav button:hover{background:var(--grey-1)}
+nav button[aria-selected="true"]{background:#FFF5F6;box-shadow:inset 4px 0 0 var(--red)}
+nav button:focus-visible{outline:2px solid var(--red);outline-offset:-2px}
+nav .teams{font-weight:600;font-size:13px;line-height:1.3}
+nav .teams span{display:block}
+nav .sub{font-family:var(--mono);font-size:10px;color:var(--text-2);margin-top:3px}
+.odds{display:flex;gap:4px}
+.odd{width:52px;height:38px;border:1px solid var(--odd-border);border-radius:4px;background:var(--odd-bg);display:flex;flex-direction:column;align-items:center;justify-content:center;font-family:var(--mono);font-size:12px;font-weight:700;line-height:1}
+.odd small{font-family:var(--body);font-size:9px;font-weight:500;color:var(--text-2);margin-bottom:3px}
+.odd.pick{background:var(--pick);border-color:#E6CF00}
+.odd.na{color:var(--grey-3);font-weight:400}
+.edge-pill{font-family:var(--mono);font-size:10px;padding:2px 6px;border-radius:3px;background:var(--edge-soft);color:var(--red-dark);font-weight:700;margin-left:6px}
+.edge-pill.none{background:var(--grey-2);color:var(--text-2)}
+/* panels */
+#panels{min-width:0}
+section.match{display:none;padding:22px 28px 60px;max-width:1120px;min-width:0}
 section.match[aria-hidden="false"]{display:block}
-.title{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
-.title img{width:44px;height:44px;object-fit:contain}
-.title h2{font-family:var(--display);font-size:40px;font-weight:700;margin:0;text-transform:uppercase;line-height:1}
-.title .vs{font-family:var(--display);font-size:22px;color:var(--ink-2)}
-.kick{font-family:var(--mono);font-size:12px;color:var(--ink-2);margin:6px 0 22px}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
-.card{background:var(--card);border:1px solid var(--rule);border-radius:6px;padding:16px 18px}
-.card h3{font-family:var(--display);font-size:15px;letter-spacing:1.5px;text-transform:uppercase;margin:0 0 12px;color:var(--ink-2);font-weight:700}
+.title{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.title img{width:40px;height:40px;object-fit:contain}
+.title h2{font-size:26px;font-weight:800;margin:0;line-height:1;letter-spacing:-.3px}
+.title .vs{font-size:14px;color:var(--text-2);font-weight:600}
+.kick{font-family:var(--mono);font-size:11px;color:var(--text-2);margin:6px 0 18px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.card{background:#fff;border:1px solid var(--grey-2);border-radius:8px;padding:14px 16px;min-width:0;overflow-x:auto}
+.card h3{font-size:11px;letter-spacing:.6px;text-transform:uppercase;margin:0 0 10px;color:var(--text-2);font-weight:700}
 .card.wide{grid-column:1/-1}
 /* signature: model bar with market ticks */
-.bar{position:relative;height:34px;border-radius:4px;overflow:hidden;display:flex;margin:6px 0 4px}
-.bar span{display:flex;align-items:center;justify-content:center;font-family:var(--display);font-weight:700;font-size:16px;color:#fff;min-width:0}
-.bar .h{background:var(--model)}.bar .d{background:#5A6B8C}.bar .a{background:#8A97B0}
+.bar{position:relative;height:36px;border-radius:6px;overflow:hidden;display:flex;margin:6px 0 4px}
+.bar span{display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-weight:700;font-size:14px;color:#fff;min-width:0}
+.bar .h{background:var(--black)}.bar .d{background:#55555E}.bar .a{background:#9A9AA6}
 .ticks{position:relative;height:10px;margin-bottom:8px}
 .ticks i{position:absolute;top:0;width:2px;height:10px;background:var(--market)}
-.legend{font-family:var(--mono);font-size:11px;color:var(--ink-2);display:flex;gap:16px}
+.legend{font-family:var(--mono);font-size:10px;color:var(--text-2);display:flex;gap:16px;flex-wrap:wrap}
 .legend b{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
 table{width:100%;border-collapse:collapse;font-size:13px}
-th{font-family:var(--display);font-size:12px;letter-spacing:1px;text-transform:uppercase;color:var(--ink-2);text-align:left;padding:5px 6px;border-bottom:1px solid var(--rule);font-weight:700}
-td{padding:6px;border-bottom:1px solid #EDF0F3;font-family:var(--mono);font-size:12px;white-space:nowrap}
+th{font-size:10px;letter-spacing:.5px;text-transform:uppercase;color:var(--text-2);text-align:left;padding:5px 6px;border-bottom:1px solid var(--grey-2);font-weight:700}
+td{padding:6px;border-bottom:1px solid var(--grey-1);font-family:var(--mono);font-size:12px;white-space:nowrap}
 td.txt{font-family:var(--body);font-size:13px;white-space:normal}
 tr.flag td{background:var(--edge-soft)}
-.pos{color:#9A3412;font-weight:600}.neg{color:var(--ink-2)}
-.note{background:#FFF7ED;border-left:3px solid var(--edge);padding:8px 12px;font-size:13px;margin-bottom:10px}
+.pos{color:var(--red-dark);font-weight:700}.neg{color:var(--text-2)}
+.note{background:#FFF8E0;border-left:3px solid var(--pick);padding:8px 12px;font-size:13px;margin-bottom:8px;border-radius:0 4px 4px 0}
 .form{font-family:var(--mono);letter-spacing:2px}
-.form b{color:var(--ok)}.form i{color:var(--edge);font-style:normal}.form u{text-decoration:none;color:var(--ink-2)}
-.scores{display:flex;gap:10px;flex-wrap:wrap}
-.scores div{font-family:var(--display);font-size:22px;font-weight:700;padding:6px 12px;border:1px solid var(--rule);border-radius:4px}
-.scores div small{display:block;font-family:var(--mono);font-size:11px;font-weight:400;color:var(--ink-2)}
-.empty{color:var(--ink-2);font-style:italic}
-.read{border-left:4px solid var(--edge);background:#FFF9F5}
-.read .verdict{font-family:var(--display);font-size:22px;font-weight:700;line-height:1.15;margin:0 0 8px}
-.read .conf{font-family:var(--mono);font-size:11px;color:var(--ink-2);letter-spacing:1px}
-.read .conf b{color:var(--edge);letter-spacing:2px}
-.picks{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:12px 0}
-.picks div{background:#fff;border:1px solid var(--rule);border-radius:4px;padding:8px 10px}
-.picks small{display:block;font-family:var(--display);font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--ink-2)}
-.picks .main{border-color:var(--edge)}
+.form b{color:var(--market)}.form i{color:var(--red);font-style:normal}.form u{text-decoration:none;color:var(--grey-3)}
+.scores{display:flex;gap:8px;flex-wrap:wrap}
+.scores div{font-family:var(--mono);font-size:18px;font-weight:700;padding:6px 12px;border:1px solid var(--grey-2);border-radius:6px;background:var(--grey-1)}
+.scores div small{display:block;font-size:10px;font-weight:400;color:var(--text-2)}
+.empty{color:var(--text-2);font-style:italic}
+/* reading card */
+.read{border:0;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.08);border-top:4px solid var(--red)}
+.read .verdict{font-size:20px;font-weight:800;line-height:1.2;margin:0 0 8px;letter-spacing:-.2px}
+.read .conf{font-family:var(--mono);font-size:11px;color:var(--text-2)}
+.read .conf b{color:var(--red);letter-spacing:2px}
+.picks{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:12px 0}
+.picks div{background:var(--grey-1);border:1px solid var(--grey-2);border-radius:6px;padding:10px 12px;font-weight:600}
+.picks small{display:block;font-size:10px;letter-spacing:.5px;text-transform:uppercase;color:var(--text-2);font-weight:700;margin-bottom:4px}
+.picks .main{background:var(--pick);border-color:#E6CF00;color:var(--black)}
 .synth ol{padding-left:20px}.synth li{margin-bottom:8px}
-@media (max-width:900px){.picks{grid-template-columns:1fr}}
-@media (max-width:900px){main{grid-template-columns:1fr}nav{border-right:0;border-bottom:1px solid var(--rule);max-height:40vh}.grid{grid-template-columns:1fr}section.match{padding:18px}header h1{font-size:32px}}
-@media (prefers-reduced-motion:no-preference){section.match[aria-hidden="false"]{animation:in .18s ease-out}@keyframes in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}}
+@media (max-width:900px){main{grid-template-columns:1fr}nav{border-right:0;max-height:45vh}.grid{grid-template-columns:1fr}section.match{padding:16px}.picks{grid-template-columns:1fr}header h1{font-size:15px}}
+@media (prefers-reduced-motion:no-preference){section.match[aria-hidden="false"]{animation:in .15s ease-out}@keyframes in{from{opacity:0}to{opacity:1}}}
 </style>
 </head>
 <body>
 <header>
-  <h1>Matchday ${esc(date)}<small>${matches.length} matchs · ${Object.keys(byLeague).length} championnats · ${args.seasons} saisons d'historique</small></h1>
-  <div class="meta">généré ${esc(generatedAt)}<br>cotes : ${esc(matches.find(m => m.market)?.market.bookmaker ?? '—')} · modèle : Poisson pondéré</div>
+  <h1>Analyse du jour · ${esc(date)}<small>${matches.length} matchs · ${Object.keys(byLeague).length} championnats · ${args.seasons} saisons</small></h1>
+  <div class="meta">cotes ${esc(matches.find(m => m.market)?.market.bookmaker ?? '—')} · généré ${esc(generatedAt.slice(11, 16))} UTC</div>
 </header>
 <p class="disclaimer"><b>Lecture.</b> L'edge est l'écart entre la probabilité du modèle et celle implicite dans la cote (marge retirée). Un edge positif signale un désaccord avec le marché, pas un pari gagnant : le modèle ignore les blessures, les transferts de l'été et les compositions tant qu'elles ne sont pas publiées. Le marché, lui, ne les ignore pas.</p>
 <main>
@@ -696,13 +881,27 @@ const ranked = [...R.matches].sort((a,b)=>b.bestEdge-a.bestEdge);
 const groups = {};
 for (const m of ranked) (groups[m.league.name] ??= []).push(m);
 
-nav.innerHTML = (R.synthesis ? '<h2>Journée</h2><button role="tab" data-id="synth"><div class="teams">Synthèse du jour</div><div class="sub"><span>lecture globale</span></div></button>' : '') + '<h2>Classés par edge</h2>' + ranked.map(m => navItem(m)).join('') +
-  Object.entries(groups).map(([lg, ms]) => '<h2>'+esc(lg)+'</h2>' + ms.map(navItem).join('')).join('');
+nav.innerHTML = (R.synthesis ? '<h2>Journée<span>lecture globale</span></h2><button role="tab" data-id="synth"><div class="teams"><span>Synthèse du jour</span></div><div class="sub">paris retenus · à éviter</div></button>' : '')
+  + '<h2>Meilleurs écarts<span>modèle vs marché</span></h2>' + ranked.slice(0, 5).map(navItem).join('')
+  + Object.entries(groups).map(([lg, ms]) => '<h2>'+esc(lg)+'<span>'+ms.length+' match'+(ms.length>1?'s':'')+'</span></h2>' + ms.sort((a,b)=>a.kickoff.localeCompare(b.kickoff)).map(navItem).join('')).join('');
 
+function pickKey(m){
+  // which 1N2 outcome does the written analysis (or, failing that, the model) point to?
+  const t = (m.analysis?.mainPick || '').toLowerCase();
+  const h = m.home.name.toLowerCase(), a = m.away.name.toLowerCase();
+  if (t.includes(' ou nul') || t.includes('double chance')) return null;
+  if (t.includes('nul')) return 'Draw';
+  if (t.includes(h)) return 'Home';
+  if (t.includes(a)) return 'Away';
+  return null;
+}
 function navItem(m){
   const e = m.bestEdge;
-  const pill = e>=0.05 ? '<span class="edge-pill">edge +'+(e*100).toFixed(0)+'</span>' : '<span class="edge-pill none">'+(e<0?'—':'+'+(e*100).toFixed(0))+'</span>';
-  return '<button role="tab" data-id="'+m.id+'"><div class="teams">'+esc(m.home.name)+' – '+esc(m.away.name)+'</div><div class="sub"><span>'+esc(m.league.name)+' · '+m.kickoff.slice(11,16)+'</span>'+pill+'</div></button>';
+  const pill = e>=0.05 ? '<span class="edge-pill">+'+(e*100).toFixed(0)+'</span>' : '';
+  const it = m.market?.matchWinner?.items || [];
+  const pk = pickKey(m);
+  const odd = (label, txt) => { const i = it.find(x=>x.label===label); return i ? '<div class="odd'+(pk===label?' pick':'')+'"><small>'+txt+'</small>'+i.odd.toFixed(2)+'</div>' : '<div class="odd na"><small>'+txt+'</small>—</div>'; };
+  return '<button role="tab" data-id="'+m.id+'"><div><div class="teams"><span>'+esc(m.home.name)+'</span><span>'+esc(m.away.name)+'</span></div><div class="sub">'+m.kickoff.slice(11,16)+' UTC · '+esc(m.league.name)+pill+'</div></div><div class="odds">'+odd('Home','1')+odd('Draw','N')+odd('Away','2')+'</div></button>';
 }
 
 panels.innerHTML = (R.synthesis ? synthPanel(R.synthesis) : '') + R.matches.map(panel).join('');
@@ -717,11 +916,13 @@ function synthPanel(s){
 
 function readCard(a){
   if (!a) return '';
-  if (a.error) return '<div class="card wide read"><h3>Lecture</h3><p class="empty">Analyse indisponible : '+esc(a.error)+'</p></div>';
+  if (a.error) return '<div class="card wide read"><h3>Lecture</h3><p class="empty">Analyse structurée indisponible ('+esc(a.error)+')'+(a.raw?' — texte brut ci-dessous :':'')+'</p>'+(a.raw?'<p style="margin:8px 0 0">'+esc(a.raw)+'</p>':'')+'</div>';
   return '<div class="card wide read"><h3>Lecture</h3><p class="verdict">'+esc(a.verdict)+'</p>'
     + '<div class="conf">confiance <b>'+'●'.repeat(a.confidence)+'○'.repeat(5-a.confidence)+'</b> '+a.confidence+'/5</div>'
     + '<div class="picks"><div class="main"><small>Pari principal</small>'+esc(a.mainPick)+'</div><div><small>Alternative</small>'+(a.altPick?esc(a.altPick):'<span class="empty">aucune</span>')+'</div><div><small>À éviter</small>'+(a.avoid?esc(a.avoid):'<span class="empty">—</span>')+'</div></div>'
-    + '<p style="margin:0">'+esc(a.reasoning)+'</p></div>';
+    + '<p style="margin:0">'+esc(a.reasoning)+'</p>'
+    + ((a.checks||[]).length ? '<div class="note" style="margin:10px 0 0">Contrôle automatique : '+a.checks.map(esc).join(' ')+'</div>' : '')
+    + '</div>';
 }
 
 function form(s){ return '<span class="form">'+[...(s||'')].map(c=>c==='W'?'<b>W</b>':c==='L'?'<i>L</i>':'<u>D</u>').join('')+'</span>'; }
@@ -775,8 +976,8 @@ function contextCard(m){
     const r = c.recent;
     const rec = r && r.matches ? form(r.form)+' · '+r.pointsPerGame+' pt/match · buts '+r.goalsFor+' / '+r.goalsAgainst+(r.xgFor!==null?' · xG '+r.xgFor+' / '+r.xgAgainst:'') : '<span class="empty">pas de matchs récents</span>';
     const rows = r ? r.rows.map(x=>'<tr><td>'+x.date+'</td><td>'+x.venue+'</td><td class="txt">'+esc(x.opponent)+'</td><td>'+x.score+'</td><td>'+(x.xg||'—')+'</td></tr>').join('') : '';
-    const tr = c.transfers ? c.transfers.arrivals+' arrivées ('+c.transfers.permanentArrivals+' définitives) · '+c.transfers.departures+' départs' : '';
-    const co = c.coach ? esc(c.coach.name)+(c.coach.daysInCharge!==null?' · en poste depuis '+c.coach.daysInCharge+' j':'')+(c.coach.isNew?' <span class="edge-pill">nouveau</span>':'') : '';
+    const tr = c.transfers ? c.transfers.arrivals+' arrivées ('+c.transfers.permanentArrivals+' définitives'+(c.transfers.turnover!==null?', '+Math.round(c.transfers.turnover*100)+'% de l\\'effectif':'')+') · '+c.transfers.departures+' départs' : '';
+    const co = c.coach ? esc(c.coach.name)+(c.coach.appointedThisSummer?' · nommé cet été':(c.coach.daysInCharge!==null?' · en poste depuis '+c.coach.daysInCharge+' j':''))+(c.coach.isNew?' <span class="edge-pill">nouveau</span>':'') : '<span class="empty">inconnu</span>';
     const kp = c.keyPlayers ? (c.keyPlayers.absentKeyPlayers.length ? '<span class="pos">Absent : '+c.keyPlayers.absentKeyPlayers.map(p=>esc(p.name)+' ('+p.goals+' buts)').join(', ')+'</span>' : 'Meilleurs buteurs '+(c.keyPlayers.topScorers.map(p=>esc(p.name)+' '+p.goals).join(', ')||'—')+' — tous disponibles') : '';
     return '<div><b>'+esc(label)+'</b><p class="kick" style="margin:4px 0">'+st+'</p><p class="kick" style="margin:4px 0">6 derniers : '+rec+'</p><table>'+rows+'</table><p class="kick" style="margin:6px 0 0">Mercato : '+tr+'<br>Coach : '+co+'<br>'+kp+'</p></div>';
   };
@@ -819,11 +1020,11 @@ export async function run (args) {
   }
 
   let synthesis = null
-  if (args.llm && ANTHROPIC_KEY) {
+  if (args.llm && LLM_KEY) {
     console.error(`\nWriting analyses with ${ANALYSIS_MODEL}…`)
     synthesis = await narrate(matches)
   } else if (args.llm) {
-    console.error('\nANTHROPIC_API_KEY not set — numbers only, no written analysis (set the key or pass --no-llm to silence this).')
+    console.error('\nNo LLM key set (ANTHROPIC_API_KEY or DEEPSEEK_API_KEY) — numbers only, no written analysis (--no-llm silences this).')
   }
 
   const report = { date: args.date, generatedAt: new Date().toISOString(), args, matches, synthesis }
